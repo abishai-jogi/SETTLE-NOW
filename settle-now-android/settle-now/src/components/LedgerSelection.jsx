@@ -104,16 +104,19 @@ export default function LedgerSelection({
 
   const handleDelete = async (ledger) => {
     setDeleteError("");
-    const balances = await fetchBalances(ledger.id);
-    const hasUnsettled = balances && Object.values(balances).some(v => Math.abs(v) > 0.005);
-    const msg = hasUnsettled
-      ? `There are unsettled balances in \"${ledger.name}\". Deleting it will not settle these balances. Are you sure you want to delete?`
-      : `Are you sure you want to delete \"${ledger.name}\"?`;
-    if (!window.confirm(msg)) return;
-    setDeleting(ledger.id);
     try {
+      const balances = await fetchBalances(ledger.id);
+      const hasUnsettled = balances && Object.values(balances).some(v => Math.abs(v) > 0.005);
+      const msg = hasUnsettled
+        ? `There are unsettled balances in \"${ledger.name}\". Deleting it will not settle these balances. Are you sure you want to delete?`
+        : `Are you sure you want to delete \"${ledger.name}\"?`;
+      if (!window.confirm(msg)) return;
+      setDeleting(ledger.id);
       const result = await onDeleteLedger(ledger.id);
       if (!result.ok) setDeleteError(result.error || "Failed to delete");
+    } catch (err) {
+      console.error("[handleDelete] error:", err);
+      setDeleteError("Something went wrong. Please try again.");
     } finally {
       setDeleting(null);
     }
