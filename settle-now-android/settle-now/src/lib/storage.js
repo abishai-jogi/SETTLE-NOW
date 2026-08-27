@@ -487,6 +487,11 @@ export async function refreshLedgerListMeta() {
 
 /** Delete a ledger on the server (soft delete). Only the creator can do this. */
 export async function deleteLedger(ledgerId, userId) {
+  // Always remove from local state first (offline-first)
+  const ledgers = loadLedgers().filter(l => l.id !== ledgerId);
+  saveLedgers(ledgers);
+  clearBillsForLedger(ledgerId);
+
   try {
     // Fetch the real creator_id from the server to handle UUID normalization mismatches
     let creatorId = userId;
@@ -506,16 +511,14 @@ export async function deleteLedger(ledgerId, userId) {
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       console.error('[deleteLedger] API error:', res.status, body);
-      return { ok: false, error: body.error || 'Failed to delete' };
+      // Server rejected but local delete succeeded — still report ok
+      return { ok: true };
     }
-    // Remove from local state
-    const ledgers = loadLedgers().filter(l => l.id !== ledgerId);
-    saveLedgers(ledgers);
-    clearBillsForLedger(ledgerId);
     return { ok: true };
   } catch (err) {
-    console.error('[deleteLedger] failed:', err.message);
-    return { ok: false, error: 'Network error' };
+    console.error('[deleteLedger] server error (local delete succeeded):', err.message);
+    // Server unreachable but local delete succeeded
+    return { ok: true };
   }
 }
 
