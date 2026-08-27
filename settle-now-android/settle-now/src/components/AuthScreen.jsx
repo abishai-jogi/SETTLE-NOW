@@ -17,12 +17,14 @@ function Wordmark() {
 const fieldClass =
   "w-full rounded-lg border border-charcoal/25 bg-ivory px-4 py-3 font-body text-lg text-charcoal outline-none transition placeholder:text-faded/50 focus:border-gold";
 
-export default function AuthScreen({ members, onSelect, onCreate, onAuthenticate }) {
+export default function AuthScreen({ members, onSelect, onCreate, onAuthenticate, onDeleteAccount }) {
   const [mode, setMode] = useState("login");
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [welcome, setWelcome] = useState(null);
+  const [showAccounts, setShowAccounts] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(null); // member to delete
 
   const switchMode = (m) => {
     setMode(m);
@@ -58,6 +60,21 @@ export default function AuthScreen({ members, onSelect, onCreate, onAuthenticate
       setPassword("");
       onSelect(member.id);
     }
+  };
+
+  const handleAccountClick = (member) => {
+    setName(member.name);
+    setMode("login");
+    setError("");
+    setShowAccounts(false);
+  };
+
+  const handleDeleteConfirm = (member) => {
+    onDeleteAccount(member.id);
+    setConfirmDelete(null);
+    setShowAccounts(false);
+    setName("");
+    setPassword("");
   };
 
   return (
@@ -155,8 +172,13 @@ export default function AuthScreen({ members, onSelect, onCreate, onAuthenticate
         )}
       </div>
 
+      {/* ── Account dots → opens popup ─────────────────────────── */}
       {members.length > 0 && (
-        <div className="mt-8 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => setShowAccounts(true)}
+          className="mt-8 flex items-center gap-2 rounded-lg px-3 py-2 transition hover:bg-charcoal/5 active:scale-[0.98]"
+        >
           {members.map((m) => (
             <span
               key={m.id}
@@ -168,12 +190,110 @@ export default function AuthScreen({ members, onSelect, onCreate, onAuthenticate
           <span className="ml-1 text-[10px] uppercase tracking-[0.25em] text-faded">
             {members.length} on the ledger
           </span>
-        </div>
+        </button>
       )}
 
       <div className="mt-4 pb-2">
         <Footer />
       </div>
+
+      {/* ── Account list popup ─────────────────────────────────── */}
+      {showAccounts && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center"
+          onClick={() => { setShowAccounts(false); setConfirmDelete(null); }}
+        >
+          <div
+            className="w-full max-w-sm rounded-t-2xl border border-gold/30 bg-ivory p-5 shadow-2xl sm:rounded-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-4 flex items-center justify-between">
+              <p className="text-[10px] uppercase tracking-[0.35em] text-gold">Accounts</p>
+              <button
+                type="button"
+                onClick={() => { setShowAccounts(false); setConfirmDelete(null); }}
+                className="text-faded transition hover:text-charcoal"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              {members.map((m) => (
+                <div key={m.id} className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => handleAccountClick(m)}
+                    className="flex flex-1 items-center gap-3 rounded-lg px-3 py-2.5 text-left transition hover:bg-charcoal/5 active:scale-[0.98]"
+                  >
+                    <Avatar person={m} size="sm" />
+                    <span className="font-body text-sm text-charcoal">{m.name}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDelete(m)}
+                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-wine/60 transition hover:bg-wine/10 hover:text-wine"
+                    title="Delete account"
+                  >
+                    🗑
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <p className="mt-4 text-center text-[10px] italic text-faded">
+              Tap a name to sign in · tap 🗑 to delete
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ── Delete confirmation dialog ─────────────────────────── */}
+      {confirmDelete && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50"
+          onClick={() => setConfirmDelete(null)}
+        >
+          <div
+            className="mx-4 w-full max-w-sm rounded-2xl border border-wine/30 bg-ivory p-6 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3">
+              <Avatar person={confirmDelete} size="md" />
+              <div>
+                <p className="font-display text-xl text-charcoal">{confirmDelete.name}</p>
+                <p className="text-[10px] uppercase tracking-[0.2em] text-faded">Account</p>
+              </div>
+            </div>
+
+            <div className="gold-hairline my-4" />
+
+            <p className="text-sm text-charcoal">
+              Are you sure you want to permanently delete <strong>{confirmDelete.name}</strong>'s account?
+            </p>
+            <p className="mt-2 text-[11px] italic text-faded">
+              This will remove all local data for this account. This cannot be undone.
+            </p>
+
+            <div className="mt-5 flex gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmDelete(null)}
+                className="flex-1 rounded-lg border border-charcoal/20 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] text-charcoal transition hover:bg-charcoal/5"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDeleteConfirm(confirmDelete)}
+                className="flex-1 rounded-lg bg-wine py-2.5 text-xs font-semibold uppercase tracking-[0.2em] text-ivory shadow transition hover:bg-[#8d2532] active:scale-[0.98]"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

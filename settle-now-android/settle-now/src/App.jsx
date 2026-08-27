@@ -126,6 +126,14 @@ export default function App() {
     return member;
   };
 
+  const deleteAccount = (memberId) => {
+    setMembers((prev) => prev.filter((m) => m.id !== memberId));
+    if (userId === memberId) {
+      setUserId(null);
+      setSelectedLedgerId(null);
+    }
+  };
+
   const handleCreateLedger = async (name) => {
     const result = await createLedger(name, userId, me?.name);
     // Refresh members from localStorage (upsertMembers already wrote there)
@@ -168,6 +176,7 @@ export default function App() {
         onSelect={setUserId}
         onCreate={createMember}
         onAuthenticate={authenticate}
+        onDeleteAccount={deleteAccount}
       />
     );
   }
