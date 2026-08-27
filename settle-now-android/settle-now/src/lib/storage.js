@@ -488,10 +488,20 @@ export async function refreshLedgerListMeta() {
 /** Delete a ledger on the server (soft delete). Only the creator can do this. */
 export async function deleteLedger(ledgerId, userId) {
   try {
+    // Fetch the real creator_id from the server to handle UUID normalization mismatches
+    let creatorId = userId;
+    try {
+      const roomRes = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}`);
+      if (roomRes.ok) {
+        const roomData = await roomRes.json();
+        if (roomData.ledger?.created_by) creatorId = roomData.ledger.created_by;
+      }
+    } catch (_) { /* fallback to local userId */ }
+
     const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: userId }),
+      body: JSON.stringify({ user_id: creatorId }),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
