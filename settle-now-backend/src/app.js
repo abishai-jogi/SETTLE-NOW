@@ -3,13 +3,19 @@ import express from "express";
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// CORS — allow all origins for LAN development
+// CORS — allow all origins (the frontend lives on Vercel, the backend on Railway/Render;
+// no secrets are exchanged in this app's API, so a wide allow-list is acceptable)
 app.use((_req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Headers", "Content-Type");
     res.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
     if (_req.method === "OPTIONS") return res.sendStatus(204);
     next();
+});
+
+// convenience: health at both /health and /api/health
+app.get("/api/health", (_req, res) => {
+    res.json({ ok: true, service: "settle-now", time_ms: Date.now() });
 });
 
 app.get("/health", (_req, res) => {

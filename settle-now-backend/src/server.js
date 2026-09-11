@@ -19,7 +19,23 @@ if (fs.existsSync(envPath)) {
 
 const { default: app } = await import("./app.js");
 
+// Auto-create tables on first boot so a fresh cloud database (Railway/Render/Neon)
+// works with zero manual SQL. Safe to run every start: everything is IF NOT EXISTS.
+async function ensureSchema() {
+    const schemaPath = path.join(here, "..", "db", "schema.sql");
+    const sql = fs.readFileSync(schemaPath, "utf8");
+    const { query } = await import("./db.js");
+    await query(sql);
+    console.log("[schema] verified/created all tables");
+}
+
 const port = Number(process.env.PORT ?? 4000);
+try {
+    await ensureSchema();
+} catch (err) {
+    console.error("[schema] bootstrap failed:", err.message);
+    console.error("[schema] server will start anyway — check DATABASE_URL if queries fail");
+}
 app.listen(port, '0.0.0.0', () => {
     console.log(`Settle Now sync server listening on http://localhost:${port}`);
     console.log(`  (LAN access: http://0.0.0.0:${port})`);
