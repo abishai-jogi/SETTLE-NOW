@@ -35,7 +35,3 @@ export function genUuid() {
     hex.slice(20, 32),
   ].join('-');
 }
-
-export function safeId(prefix = "id") {
-  return `${prefix}-${genUuid()}`;
-}

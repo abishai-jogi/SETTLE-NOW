@@ -5,12 +5,14 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 // Minimal .env loader (no dependency): KEY=VALUE lines from backend/.env
+// Values are trimmed and stripped of CR so Windows CRLF line endings can't poison them.
 const envPath = path.join(here, "..", ".env");
 if (fs.existsSync(envPath)) {
     for (const line of fs.readFileSync(envPath, "utf8").split("\n")) {
         const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/);
         if (match && process.env[match[1]] === undefined) {
-            process.env[match[1]] = match[2].replace(/^["']|["']$/g, "");
+            const value = match[2].replace(/["']/g, "").trim();
+            if (value) process.env[match[1]] = value;
         }
     }
 }

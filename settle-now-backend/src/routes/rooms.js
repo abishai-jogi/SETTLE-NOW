@@ -62,7 +62,7 @@ router.post("/rooms/create", async (req, res) => {
     await query(
       `INSERT INTO users (id, name, color, created_at, updated_at, is_deleted)
        VALUES ($1, $2, $3, $4, $4, FALSE)
-       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, color = COALESCE(users.color, EXCLUDED.color)`,
+       ON CONFLICT (id) DO UPDATE SET name = COALESCE(NULLIF(EXCLUDED.name, ''), users.name), color = COALESCE(users.color, EXCLUDED.color)`,
       [dbUserId, creator_name ?? "", userColor, now]
     );
 
@@ -81,7 +81,7 @@ router.post("/rooms/create", async (req, res) => {
       [ledgerId, dbUserId, now]
     );
 
-    console.log(`[rooms] Created ledger "${name}" (${ledgerId}) by ${creator_name} with code ${inviteCode}`);
+    console.log(`[rooms/create] Created ledger "${name}" (${ledgerId}) by ${creator_name} with code ${inviteCode}`);
 
     res.json({
       ledger: {
@@ -121,7 +121,14 @@ router.post("/rooms/join", async (req, res) => {
         );
 
         if (!room.rows.length) {
+            // Debug: log all active invite codes to help diagnose "not found" errors
+            const allCodes = await query("SELECT id, invite_code, name, created_at FROM rooms WHERE is_deleted = FALSE ORDER BY created_at DESC LIMIT 20");
             console.log(`[rooms/join] No ledger found for code "${code}"`);
+            if (allCodes.rows.length > 0) {
+                console.log(`[rooms/join] Active codes in DB: ${allCodes.rows.map(r => `${r.invite_code}(${r.name})`).join(', ')}`);
+            } else {
+                console.log(`[rooms/join] WARNING: No active rooms in database at all!`);
+            }
             return res.status(404).json({ error: "room_not_found" });
         }
 
@@ -137,7 +144,7 @@ router.post("/rooms/join", async (req, res) => {
         await query(
             `INSERT INTO users (id, name, color, created_at, updated_at, is_deleted)
              VALUES ($1, $2, $3, $4, $4, FALSE)
-             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, color = COALESCE(users.color, EXCLUDED.color)`,
+             ON CONFLICT (id) DO UPDATE SET name = COALESCE(NULLIF(EXCLUDED.name, ''), users.name), color = COALESCE(users.color, EXCLUDED.color)`,
             [dbUserId, user_name ?? "", userColor, now]
         );
 
@@ -179,12 +186,19 @@ router.post("/rooms/join", async (req, res) => {
             [roomId]
         );
 
+        // Fetch the creator's ID to include in the response
+        const creatorResult = await query(
+            "SELECT created_by FROM rooms WHERE id = $1",
+            [roomId]
+        );
+
         res.json({
             ledger: {
                 id: room.rows[0].id,
                 name: room.rows[0].name,
                 invite_code: room.rows[0].invite_code,
                 created_at: room.rows[0].created_at,
+                created_by: creatorResult.rows[0]?.created_by ?? null,
                 member_ids: members.rows.map((m) => m.id),
             },
             members: members.rows,

@@ -1,16 +1,19 @@
-import { safeId } from "./uid.js";
+import { genUuid } from "./uid.js";
 
 const MEMBERS_KEY = "settle-now.members.v3";
 export const BILLS_KEY = "settle-now.bills.v3";
 const USER_KEY = "settle-now.user.v2";
 const LEDGERS_KEY = "settle-now.ledgers.v1";
 
-// API base — proxy through Vite dev server so same-origin works everywhere (LAN, ngrok, etc.)
+// API base — priority:
+// 1. VITE_API_BASE env var set at build time (used for the Vercel production build)
+// 2. Same-origin on localhost (Vite dev server proxies /api → localhost:4000)
+// 3. Same-origin anywhere else (only works if the backend is hosted at the same domain)
 const API_BASE = (() => {
+  const envBase = typeof import.meta !== "undefined" && import.meta.env ? import.meta.env.VITE_API_BASE : null;
+  if (envBase) return envBase.replace(/\/$/, "");
   const loc = typeof window !== "undefined" ? window.location : null;
   if (!loc) return "";
-  // If on localhost (dev), proxy through Vite which forwards to :4000
-  // If on any other host (LAN/ngrok), also proxy through Vite
   return `${loc.protocol}//${loc.host}`;
 })();
 
@@ -241,7 +244,7 @@ export async function createLedger(name, creatorId, creatorName) {
 
     // Offline fallback — create locally (won't be visible to other devices)
     const local = {
-      id: safeId("ledger"),
+      id: genUuid(),
       name: name.trim(),
       inviteCode: generateInviteCode(),
       createdBy: creatorId,
@@ -277,6 +280,11 @@ export async function joinLedger(inviteCode, userId, userName) {
     if (res.status === 404) {
       console.log(`[joinLedger] No ledger found for code "${code}"`);
       return null;
+    }
+    if (res.status === 405 || res.status === 501) {
+      // Backend routes missing — likely the API is not deployed at this origin
+      console.error(`[joinLedger] Backend API not reachable (${res.status}) — is the sync server deployed?`);
+      return "unreachable";
     }
     if (res.status === 409) {
       return "full";

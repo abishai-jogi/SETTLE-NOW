@@ -93,6 +93,8 @@ export default function LedgerSelection({
         setError("No ledger found with that code.");
       } else if (result === "full") {
         setError("That ledger already has 10 members.");
+      } else if (result === "unreachable") {
+        setError("Sync server not reachable. The backend may not be deployed yet.");
       } else {
         onSelectLedger(result.id);
       }

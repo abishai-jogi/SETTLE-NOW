@@ -22,7 +22,7 @@ import {
   deleteLedger,
   refreshLedgerListMeta,
 } from "./lib/storage.js";
-import { safeId } from "./lib/uid.js";
+import { genUuid } from "./lib/uid.js";
 import AuthScreen from "./components/AuthScreen.jsx";
 import LedgerSelection from "./components/LedgerSelection.jsx";
 import ChatScreen from "./components/ChatScreen.jsx";
@@ -72,12 +72,33 @@ export default function App() {
     }
   }, [selectedLedgerId]);
 
-  // Poll server for new bills every 5 seconds while a ledger is open
+  // Poll server for new bills AND member-list changes every 5 seconds while a ledger is open.
+  // Member polling makes the member count update live on all devices when someone joins.
   useEffect(() => {
     if (!selectedLedgerId) return;
     let alive = true;
     const poll = async () => {
       if (!alive) return;
+      // ── members: refresh from server so joins show up without a manual reload ──
+      try {
+        const ledgerBefore = loadLedgers().find(x => x.id === selectedLedgerId);
+        const membersBefore = loadMembers();
+        const beforeKey = JSON.stringify([
+          ledgerBefore?.memberIds ?? [],
+          membersBefore.filter(m => ledgerBefore?.memberIds.includes(m.id)).map(m => [m.id, m.name, m.color]),
+        ]);
+        await refreshLedger(selectedLedgerId);
+        const ledgerAfter = loadLedgers().find(x => x.id === selectedLedgerId);
+        const membersAfter = loadMembers();
+        const afterKey = JSON.stringify([
+          ledgerAfter?.memberIds ?? [],
+          membersAfter.filter(m => ledgerAfter?.memberIds.includes(m.id)).map(m => [m.id, m.name, m.color]),
+        ]);
+        if (afterKey !== beforeKey) {
+          setMembers(loadMembers());
+        }
+      } catch { /* member poll is best-effort; bill poll below still runs */ }
+      // ── bills ──
       const serverBills = await fetchBillsFromServer(selectedLedgerId);
       if (!alive || !serverBills) return;
       // Merge server bills into localStorage (skip duplicates)
@@ -108,7 +129,7 @@ export default function App() {
     if (members.some((m) => m.name.toLowerCase() === clean.toLowerCase())) return null;
     const salt = makeSalt();
     const member = {
-      id: safeId("m"),
+      id: genUuid(),
       name: clean,
       color: firstFreeColor(members.map((m) => m.color)),
       salt,
