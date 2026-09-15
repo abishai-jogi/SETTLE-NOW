@@ -1,0 +1,318 @@
+import { useEffect, useState, useCallback } from "react";
+import { firstFreeColor } from "./config/people.js";
+import { hashPassword, makeSalt } from "./lib/auth.js";
+import {
+  loadBills,
+  loadMembers,
+  saveMembers,
+  loadSavedUser,
+  saveUser,
+  clearUser,
+  loadLedgers,
+  createLedger,
+  joinLedger,
+  getLedgerMembers,
+  upsertMembers,
+  refreshLedger,
+  fetchBillsFromServer,
+  clearBillsOnServer,
+  loadAllBillsLocal,
+  BILLS_KEY,
+  deleteLedger,
+  refreshLedgerListMeta,
+  reconcileLedgersWithServer,
+  isLocalAccount,
+} from "./lib/storage.js";
+import { genUuid } from "./lib/uid.js";
+import AuthScreen from "./components/AuthScreen.jsx";
+import LedgerSelection from "./components/LedgerSelection.jsx";
+import ChatScreen from "./components/ChatScreen.jsx";
+import MonthlyTotals from "./components/MonthlyTotals.jsx";
+import MonthlyHistory from "./components/MonthlyHistory.jsx";
+
+export default function App() {
+  const [members, setMembers] = useState(loadMembers);
+  const [userId, setUserId] = useState(() => {
+    const id = loadSavedUser();
+    return id && loadMembers().some((m) => m.id === id) ? id : null;
+  });
+  const [selectedLedgerId, setSelectedLedgerId] = useState(null);
+  const [view, setView] = useState("chat"); // "chat" | "monthlyTotals" | "monthlyHistory"
+  const [billsVersion, setBillsVersion] = useState(0);
+  const [ledgerVersion, setLedgerVersion] = useState(0);
+
+  const bills = selectedLedgerId ? loadBills(selectedLedgerId) : [];
+  const refreshBills = useCallback(() => setBillsVersion((v) => v + 1), []);
+
+  useEffect(() => {
+    const handler = () => setBillsVersion((v) => v + 1);
+    window.addEventListener("storage", handler);
+    return () => window.removeEventListener("storage", handler);
+  }, []);
+
+  useEffect(() => {
+    saveMembers(members);
+  }, [members]);
+
+  useEffect(() => {
+    if (userId) saveUser(userId);
+    else clearUser();
+  }, [userId]);
+
+  // Validate userId still exists in members — but don't clear immediately
+  // during join/create flows where members may be stale for one render cycle.
+  const userExists = userId && members.some((m) => m.id === userId);
+
+  // Reset view when changing ledgers + refresh members from server
+  useEffect(() => {
+    setView("chat");
+    if (selectedLedgerId) {
+      refreshLedger(selectedLedgerId).then(() => {
+        setMembers(loadMembers());
+        setBillsVersion(v => v + 1);
+      });
+    }
+  }, [selectedLedgerId]);
+
+  // Poll server for new bills AND member-list changes every 5 seconds while a ledger is open.
+  // Member polling makes the member count update live on all devices when someone joins.
+  useEffect(() => {
+    if (!selectedLedgerId) return;
+    let alive = true;
+    const poll = async () => {
+      if (!alive) return;
+      // ── members: refresh from server so joins show up without a manual reload ──
+      try {
+        const ledgerBefore = loadLedgers().find(x => x.id === selectedLedgerId);
+        const membersBefore = loadMembers();
+        const beforeKey = JSON.stringify([
+          ledgerBefore?.memberIds ?? [],
+          membersBefore.filter(m => ledgerBefore?.memberIds.includes(m.id)).map(m => [m.id, m.name, m.color]),
+        ]);
+        const refreshed = await refreshLedger(selectedLedgerId);
+        if (refreshed?.deleted) {
+          // Ledger was deleted by its admin on another device — drop out of it here too.
+          if (alive) setSelectedLedgerId(null);
+          return;
+        }
+        const ledgerAfter = loadLedgers().find(x => x.id === selectedLedgerId);
+        const membersAfter = loadMembers();
+        const afterKey = JSON.stringify([
+          ledgerAfter?.memberIds ?? [],
+          membersAfter.filter(m => ledgerAfter?.memberIds.includes(m.id)).map(m => [m.id, m.name, m.color]),
+        ]);
+        if (afterKey !== beforeKey) {
+          setMembers(loadMembers());
+        }
+      } catch { /* member poll is best-effort; bill poll below still runs */ }
+      // ── bills ──
+      const serverBills = await fetchBillsFromServer(selectedLedgerId);
+      if (!alive || !serverBills) return;
+      // Merge server bills into localStorage (skip duplicates)
+      const local = loadAllBillsLocal();
+      const localIds = new Set(local.map(b => b.id));
+      let changed = false;
+      for (const b of serverBills) {
+        if (!localIds.has(b.id)) {
+          // Ensure timestamps are numbers (server may return strings from PostgreSQL BIGINT)
+          if (typeof b.timestamp === 'string') b.timestamp = Number(b.timestamp);
+          if (typeof b.amount === 'string') b.amount = Number(b.amount);
+          local.push(b);
+          changed = true;
+        }
+      }
+      if (changed) {
+        localStorage.setItem(BILLS_KEY, JSON.stringify(local));
+        setBillsVersion(v => v + 1);
+      }
+    };
+    poll(); // initial fetch
+    const interval = setInterval(poll, 5000);
+    return () => { alive = false; clearInterval(interval); };
+  }, [selectedLedgerId]);
+
+  // Only accounts created on THIS device (with credentials) can be signed
+  // into here. Server-known members (friends from other devices) exist in the
+  // list for balances/bubbles only — they are never offered as login options.
+  const localAccounts = members.filter(isLocalAccount);
+
+  const createMember = (name, password) => {
+    const clean = name.trim();
+    // Uniqueness vs ALL members — if a server-known member (friend) already
+    // uses the name, creating a second record with it could never merge.
+    if (members.some((m) => m.name.toLowerCase() === clean.toLowerCase())) return null;
+    const salt = makeSalt();
+    const member = {
+      id: genUuid(),
+      name: clean,
+      color: firstFreeColor(members.map((m) => m.color)),
+      salt,
+      passwordHash: hashPassword(password, salt),
+      isLocalAccount: true,
+      joinedAt: Date.now(),
+    };
+    setMembers((prev) => [...prev, member]);
+    return member;
+  };
+
+  const authenticate = (name, password) => {
+    const clean = name.trim().toLowerCase();
+    const member = localAccounts.find((m) => m.name.toLowerCase() === clean);
+    if (!member || member.passwordHash !== hashPassword(password, member.salt)) return null;
+    return member;
+  };
+
+  const deleteAccount = (memberId) => {
+    // Deleting an account only makes sense for accounts that live on this
+    // device — server-known members (friends) are just stubs for rendering.
+    const target = members.find((m) => m.id === memberId);
+    if (!target || !isLocalAccount(target)) return;
+    setMembers((prev) => prev.filter((m) => m.id !== memberId));
+    if (userId === memberId) {
+      setUserId(null);
+      setSelectedLedgerId(null);
+    }
+  };
+
+  const handleCreateLedger = async (name) => {
+    const result = await createLedger(name, userId, me?.name);
+    // Refresh members from localStorage (upsertMembers already wrote there)
+    setMembers(loadMembers());
+    // If server assigned a different UUID, update session
+    if (result.dbUserId && result.dbUserId !== userId) {
+      setUserId(result.dbUserId);
+    }
+    return result.ledger;
+  };
+  const handleJoinLedger = async (code) => {
+    const result = await joinLedger(code, userId, me?.name);
+    if (result === null || result === "full" || result === "unreachable") return result;
+    // Server may have just reported the ledger deleted (race: admin deleted
+    // it between lookup and join) — joinLedger purges it locally in that case.
+    if (result.deleted) return null;
+    // Refresh members from localStorage (upsertMembers already wrote all server members)
+    setMembers(loadMembers());
+    // If server assigned a different UUID, update session
+    if (result.dbUserId && result.dbUserId !== userId) {
+      setUserId(result.dbUserId);
+    }
+    return result.ledger;
+  };
+
+  // Background-refresh createdBy for any older local ledgers missing it,
+  // and reconcile with the server: ledgers deleted by their admin (or where
+  // this account was removed) disappear here too, on every device.
+  useEffect(() => {
+    if (!selectedLedgerId && userId) {
+      (async () => {
+        await refreshLedgerListMeta();
+        const changed = await reconcileLedgersWithServer(userId);
+        if (changed) setMembers(loadMembers());
+        setLedgerVersion(v => v + 1);
+      })();
+    }
+  }, [selectedLedgerId, userId]);
+
+  // ── Routing ────────────────────────────────────────────────────────
+
+  const me = userId ? members.find((m) => m.id === userId) : null;
+
+  if (!userId || !me) {
+    return (
+      <AuthScreen
+        members={localAccounts}
+        onSelect={setUserId}
+        onCreate={createMember}
+        onAuthenticate={authenticate}
+        onDeleteAccount={deleteAccount}
+      />
+    );
+  }
+
+  if (!selectedLedgerId) {
+    const ledgers = loadLedgers();
+    // eslint-disable-next-line no-unused-expressions
+    ledgerVersion; // reference so lint doesn't complain — forces re-read after refresh
+    // reconcileLedgersWithServer (above) already purged ledgers deleted by
+    // their admin, so what's on disk is exactly what still exists.
+    return (
+      <LedgerSelection
+        user={me}
+        ledgers={ledgers}
+        members={members}
+        onSelectLedger={setSelectedLedgerId}
+        onCreateLedger={handleCreateLedger}
+        onJoinLedger={handleJoinLedger}
+        onDeleteLedger={async (ledgerId) => {
+          const result = await deleteLedger(ledgerId, userId);
+          if (result.ok) {
+            // Refresh local state
+            setMembers(loadMembers());
+            if (selectedLedgerId === ledgerId) setSelectedLedgerId(null);
+          }
+          return result;
+        }}
+        onLogout={() => {
+          setUserId(null);
+          setSelectedLedgerId(null);
+        }}
+      />
+    );
+  }
+
+  const ledgers = loadLedgers();
+  const currentLedger = ledgers.find((l) => l.id === selectedLedgerId);
+  if (!currentLedger) {
+    setSelectedLedgerId(null);
+    return null;
+  }
+
+  const ledgerMembers = getLedgerMembers(currentLedger, members);
+
+  // Monthly Totals view
+  if (view === "monthlyTotals") {
+    return (
+      <MonthlyTotals
+        user={me}
+        members={ledgerMembers}
+        bills={bills}
+        onBack={() => setView("chat")}
+        onMonthlyHistory={() => setView("monthlyHistory")}
+      />
+    );
+  }
+
+  // Monthly Total History view
+  if (view === "monthlyHistory") {
+    return (
+      <MonthlyHistory
+        user={me}
+        members={ledgerMembers}
+        bills={bills}
+        onBack={() => setView("monthlyTotals")}
+      />
+    );
+  }
+
+  // Chat view
+  return (
+    <ChatScreen
+      user={me}
+      members={ledgerMembers}
+      ledger={currentLedger}
+      bills={bills}
+      onRefreshBills={refreshBills}
+      onBack={() => setSelectedLedgerId(null)}
+      onLogout={() => {
+        setUserId(null);
+        setSelectedLedgerId(null);
+      }}
+      onClear={() => {
+        clearBillsOnServer(selectedLedgerId);
+        refreshBills();
+      }}
+      onMonthlyTotals={() => setView("monthlyTotals")}
+      onMonthlyHistory={() => setView("monthlyHistory")}
+    />
+  );
+}
