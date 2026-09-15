@@ -29,7 +29,8 @@ async function ensureSchema() {
     console.log("[schema] verified/created all tables");
 }
 
-const port = Number(process.env.PORT ?? 4000);
+// Number("") is 0, so fall back whenever PORT is unset, empty, or non-numeric
+const port = Number(process.env.PORT) > 0 ? Number(process.env.PORT) : 4000;
 try {
     await ensureSchema();
 } catch (err) {

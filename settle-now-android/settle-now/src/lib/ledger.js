@@ -37,6 +37,55 @@ export const groupTotal = (bills) =>
   round2(bills.reduce((a, b) => a + b.amount, 0));
 
 /**
+ * Label for a calendar month given "now" — the pure, testable core of the
+ * history labeling. Distance is measured in whole calendar months from the
+ * current (possibly incomplete) month:
+ *   0 = current month (in progress → null, never listed)
+ *   1 = last completed month → "Last Month"
+ *   2 → "1", 3 → "2", ... so labels auto-shift when a new month begins.
+ */
+export function monthLabelFor(monthDate, now = new Date()) {
+  const monthsAway =
+    (monthDate.getFullYear() - now.getFullYear()) * 12 +
+    (monthDate.getMonth() - now.getMonth());
+  if (monthsAway >= 0) return null; // current or future month → not completed
+  const completedBack = -monthsAway; // 1 = last completed month
+  return completedBack === 1 ? "Last Month" : String(completedBack - 1);
+}
+
+/**
+ * Monthly total history: bucket bills by calendar month, sum per month,
+ * and label them dynamically (most recent completed month = "Last Month",
+ * older ones numbered 1, 2, 3... from the current month backwards).
+ *
+ * Returns entries newest-first: [{ monthOf, label, total }].
+ * Only completed months that actually have expenses are included.
+ */
+export function monthlyHistory(bills, now = new Date()) {
+  // Bucket by (year, month)
+  const buckets = new Map();
+  for (const b of bills) {
+    const d = new Date(b.timestamp);
+    const key = `${d.getFullYear()}|${d.getMonth()}`;
+    buckets.set(key, (buckets.get(key) || 0) + b.amount);
+  }
+
+  // One entry per bucket, labeled via monthLabelFor
+  const entries = [];
+  for (const [key, sum] of buckets) {
+    const [year, month] = key.split("|").map(Number);
+    const firstOfMonth = new Date(year, month, 1);
+    const label = monthLabelFor(firstOfMonth, now);
+    if (label === null) continue; // current (in-progress) or future month
+    entries.push({ monthOf: firstOfMonth, key, label, total: round2(sum) });
+  }
+
+  // Newest-first
+  entries.sort((a, b) => b.monthOf.getTime() - a.monthOf.getTime());
+  return entries;
+}
+
+/**
  * Greedy debt simplification: match largest creditor with largest debtor,
  * repeat until balanced. Returns list of { from, to, amount }.
  */

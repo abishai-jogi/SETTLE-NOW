@@ -7,7 +7,7 @@ import Footer from "./Footer.jsx";
  * Monthly Totals page — shows each member's total paid this calendar month.
  * Reached by tapping the ledger name in the chat header.
  */
-export default function MonthlyTotals({ user, members, bills, onBack }) {
+export default function MonthlyTotals({ user, members, bills, onBack, onMonthlyHistory }) {
   // Calculate each member's total paid this month (trailing 30 days)
   const totals = members.map((m) => ({
     ...m,
@@ -42,6 +42,36 @@ export default function MonthlyTotals({ user, members, bills, onBack }) {
                 Trailing 30 days · {members.length} member{members.length !== 1 ? "s" : ""}
               </p>
             </div>
+            {/* History bubble — top-right of nav bar, theme color, spaced from corner */}
+            <button
+              type="button"
+              onClick={onMonthlyHistory}
+              aria-label="Monthly total history"
+              className="rounded-full p-1 transition active:scale-95 hover:bg-white/10"
+              style={{ marginLeft: "auto" }}
+            >
+              <span
+                className="flex h-9 w-9 items-center justify-center rounded-full shadow-sm transition"
+                style={{
+                  backgroundColor: "#a98548",
+                }}
+              >
+                <svg
+                  className="h-4.5 w-4.5"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="#f6f1e7"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  {/* Standard history/rewind icon: clock ring with backward arrow */}
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 7v5l-3 3" />
+                  <path d="M12 12h.01" />
+                </svg>
+              </span>
+            </button>
           </div>
           <div className="border-t border-white/10">
             <div className="mx-auto flex w-full max-w-3xl items-center justify-between px-4 py-2.5">

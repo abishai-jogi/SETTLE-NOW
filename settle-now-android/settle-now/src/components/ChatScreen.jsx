@@ -216,7 +216,7 @@ function NumpadSheet({ user, draft, setDraft, onSend, canSend, onClose }) {
 }
 
 /* ── Main ChatScreen ─────────────────────────────────────────────────── */
-export default function ChatScreen({ user, members, ledger, bills, onRefreshBills, onBack, onLogout, onClear, onMonthlyTotals }) {
+export default function ChatScreen({ user, members, ledger, bills, onRefreshBills, onBack, onLogout, onClear, onMonthlyTotals, onMonthlyHistory }) {
   const [draft, setDraft] = useState("");
   const [showSettlement, setShowSettlement] = useState(false);
   const [showNumpad, setShowNumpad] = useState(false);

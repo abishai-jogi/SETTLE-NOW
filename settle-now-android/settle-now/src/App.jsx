@@ -27,6 +27,7 @@ import AuthScreen from "./components/AuthScreen.jsx";
 import LedgerSelection from "./components/LedgerSelection.jsx";
 import ChatScreen from "./components/ChatScreen.jsx";
 import MonthlyTotals from "./components/MonthlyTotals.jsx";
+import MonthlyHistory from "./components/MonthlyHistory.jsx";
 
 export default function App() {
   const [members, setMembers] = useState(loadMembers);
@@ -35,7 +36,7 @@ export default function App() {
     return id && loadMembers().some((m) => m.id === id) ? id : null;
   });
   const [selectedLedgerId, setSelectedLedgerId] = useState(null);
-  const [view, setView] = useState("chat"); // "chat" | "monthlyTotals"
+  const [view, setView] = useState("chat"); // "chat" | "monthlyTotals" | "monthlyHistory"
   const [billsVersion, setBillsVersion] = useState(0);
   const [ledgerVersion, setLedgerVersion] = useState(0);
 
@@ -248,6 +249,19 @@ export default function App() {
         members={ledgerMembers}
         bills={bills}
         onBack={() => setView("chat")}
+        onMonthlyHistory={() => setView("monthlyHistory")}
+      />
+    );
+  }
+
+  // Monthly Total History view
+  if (view === "monthlyHistory") {
+    return (
+      <MonthlyHistory
+        user={me}
+        members={ledgerMembers}
+        bills={bills}
+        onBack={() => setView("monthlyTotals")}
       />
     );
   }
@@ -270,6 +284,7 @@ export default function App() {
         refreshBills();
       }}
       onMonthlyTotals={() => setView("monthlyTotals")}
+      onMonthlyHistory={() => setView("monthlyHistory")}
     />
   );
 }
