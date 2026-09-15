@@ -188,7 +188,7 @@ export default function AuthScreen({ members, onSelect, onCreate, onAuthenticate
             />
           ))}
           <span className="ml-1 text-[10px] uppercase tracking-[0.25em] text-faded">
-            {members.length} on the ledger
+            {members.length} on this device
           </span>
         </button>
       )}

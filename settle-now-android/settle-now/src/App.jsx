@@ -12,7 +12,6 @@ import {
   createLedger,
   joinLedger,
   getLedgerMembers,
-  updateMemberId,
   upsertMembers,
   refreshLedger,
   fetchBillsFromServer,
@@ -21,6 +20,8 @@ import {
   BILLS_KEY,
   deleteLedger,
   refreshLedgerListMeta,
+  reconcileLedgersWithServer,
+  isLocalAccount,
 } from "./lib/storage.js";
 import { genUuid } from "./lib/uid.js";
 import AuthScreen from "./components/AuthScreen.jsx";
@@ -88,7 +89,12 @@ export default function App() {
           ledgerBefore?.memberIds ?? [],
           membersBefore.filter(m => ledgerBefore?.memberIds.includes(m.id)).map(m => [m.id, m.name, m.color]),
         ]);
-        await refreshLedger(selectedLedgerId);
+        const refreshed = await refreshLedger(selectedLedgerId);
+        if (refreshed?.deleted) {
+          // Ledger was deleted by its admin on another device — drop out of it here too.
+          if (alive) setSelectedLedgerId(null);
+          return;
+        }
         const ledgerAfter = loadLedgers().find(x => x.id === selectedLedgerId);
         const membersAfter = loadMembers();
         const afterKey = JSON.stringify([
@@ -125,8 +131,15 @@ export default function App() {
     return () => { alive = false; clearInterval(interval); };
   }, [selectedLedgerId]);
 
+  // Only accounts created on THIS device (with credentials) can be signed
+  // into here. Server-known members (friends from other devices) exist in the
+  // list for balances/bubbles only — they are never offered as login options.
+  const localAccounts = members.filter(isLocalAccount);
+
   const createMember = (name, password) => {
     const clean = name.trim();
+    // Uniqueness vs ALL members — if a server-known member (friend) already
+    // uses the name, creating a second record with it could never merge.
     if (members.some((m) => m.name.toLowerCase() === clean.toLowerCase())) return null;
     const salt = makeSalt();
     const member = {
@@ -135,6 +148,7 @@ export default function App() {
       color: firstFreeColor(members.map((m) => m.color)),
       salt,
       passwordHash: hashPassword(password, salt),
+      isLocalAccount: true,
       joinedAt: Date.now(),
     };
     setMembers((prev) => [...prev, member]);
@@ -143,12 +157,16 @@ export default function App() {
 
   const authenticate = (name, password) => {
     const clean = name.trim().toLowerCase();
-    const member = members.find((m) => m.name.toLowerCase() === clean);
+    const member = localAccounts.find((m) => m.name.toLowerCase() === clean);
     if (!member || member.passwordHash !== hashPassword(password, member.salt)) return null;
     return member;
   };
 
   const deleteAccount = (memberId) => {
+    // Deleting an account only makes sense for accounts that live on this
+    // device — server-known members (friends) are just stubs for rendering.
+    const target = members.find((m) => m.id === memberId);
+    if (!target || !isLocalAccount(target)) return;
     setMembers((prev) => prev.filter((m) => m.id !== memberId));
     if (userId === memberId) {
       setUserId(null);
@@ -168,7 +186,10 @@ export default function App() {
   };
   const handleJoinLedger = async (code) => {
     const result = await joinLedger(code, userId, me?.name);
-    if (result === null || result === "full") return result;
+    if (result === null || result === "full" || result === "unreachable") return result;
+    // Server may have just reported the ledger deleted (race: admin deleted
+    // it between lookup and join) — joinLedger purges it locally in that case.
+    if (result.deleted) return null;
     // Refresh members from localStorage (upsertMembers already wrote all server members)
     setMembers(loadMembers());
     // If server assigned a different UUID, update session
@@ -178,12 +199,17 @@ export default function App() {
     return result.ledger;
   };
 
-  // Background-refresh createdBy for any older local ledgers missing it
+  // Background-refresh createdBy for any older local ledgers missing it,
+  // and reconcile with the server: ledgers deleted by their admin (or where
+  // this account was removed) disappear here too, on every device.
   useEffect(() => {
     if (!selectedLedgerId && userId) {
-      refreshLedgerListMeta().then(() => {
+      (async () => {
+        await refreshLedgerListMeta();
+        const changed = await reconcileLedgersWithServer(userId);
+        if (changed) setMembers(loadMembers());
         setLedgerVersion(v => v + 1);
-      });
+      })();
     }
   }, [selectedLedgerId, userId]);
 
@@ -194,7 +220,7 @@ export default function App() {
   if (!userId || !me) {
     return (
       <AuthScreen
-        members={members}
+        members={localAccounts}
         onSelect={setUserId}
         onCreate={createMember}
         onAuthenticate={authenticate}
@@ -207,6 +233,8 @@ export default function App() {
     const ledgers = loadLedgers();
     // eslint-disable-next-line no-unused-expressions
     ledgerVersion; // reference so lint doesn't complain — forces re-read after refresh
+    // reconcileLedgersWithServer (above) already purged ledgers deleted by
+    // their admin, so what's on disk is exactly what still exists.
     return (
       <LedgerSelection
         user={me}

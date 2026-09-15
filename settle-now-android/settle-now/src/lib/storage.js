@@ -42,6 +42,17 @@ export function loadMembers() {
 export const saveMembers = (members) =>
   localStorage.setItem(MEMBERS_KEY, JSON.stringify(members));
 
+/**
+ * True if this member record is an account created ON THIS DEVICE (has
+ * credentials). Members pulled from the server (friends who joined from
+ * other devices) are stored as stubs without credentials and are NOT local
+ * accounts — they must never appear on the sign-in screen.
+ * Also migrates pre-flag data: any member with a password hash was by
+ * definition created locally.
+ */
+export const isLocalAccount = (m) =>
+  Boolean(m && (m.isLocalAccount === true || (m.passwordHash || "").length > 0));
+
 /** Update a member's ID (when server assigns a proper UUID for cross-device sync). */
 export function updateMemberId(oldId, newId) {
   if (oldId === newId) return;
@@ -166,6 +177,21 @@ const loadAllBills = loadAllBillsLocal;
 export function clearBillsForLedger(ledgerId) {
   const all = loadAllBills().filter((b) => b.ledgerId !== ledgerId);
   localStorage.setItem(BILLS_KEY, JSON.stringify(all));
+}
+
+/**
+ * Remove a deleted ledger from EVERY local cache: ledgers, bills, settlements
+ * and any memberships pointing at it. Called when the server reports the
+ * ledger no longer exists (the creator deleted it), so it disappears on all
+ * devices — not just the one that deleted it.
+ */
+export function purgeLedgerEverywhere(ledgerId) {
+  saveLedgers(loadLedgers().filter((l) => l.id !== ledgerId));
+  clearBillsForLedger(ledgerId);
+  const allSettlements = loadAllSettlements().filter((s) => s.ledgerId !== ledgerId);
+  localStorage.setItem(SETTLEMENTS_KEY, JSON.stringify(allSettlements));
+  // Member records themselves stay — they are shared across ledgers
+  // (e.g. the same household account on several ledgers).
 }
 
 // ── Settlements (recorded debt payments) ─────────────────────────────
@@ -357,6 +383,7 @@ export async function createLedger(name, creatorId, creatorName) {
       createdBy: creatorId,
       createdAt: Date.now(),
       memberIds: [creatorId],
+      offlineOnly: true, // never uploaded — reconciliation must not purge it
     };
     const ledgers = loadLedgers();
     ledgers.push(local);
@@ -386,6 +413,11 @@ export async function joinLedger(inviteCode, userId, userName) {
 
     if (res.status === 404) {
       console.log(`[joinLedger] No ledger found for code "${code}"`);
+      // If a locally cached ledger shares this code, it was deleted server-side
+      // (e.g. by its admin on another device) — purge it locally too.
+      // Offline-only ledgers never existed on the server, so leave them alone.
+      const stale = loadLedgers().find((l) => l.inviteCode === code && !l.offlineOnly);
+      if (stale) purgeLedgerEverywhere(stale.id);
       return null;
     }
     if (res.status === 405 || res.status === 501) {
@@ -467,6 +499,16 @@ export function getLedgerMembers(ledger, allMembers) {
 export async function refreshLedger(ledgerId) {
   try {
     const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}`);
+    if (res.status === 404) {
+      // The ledger was deleted (by its admin on another device, for example).
+      // Purge it everywhere locally so it disappears for this user too —
+      // unless it was created offline and never uploaded (server can't know it).
+      const local = loadLedgers().find((l) => l.id === ledgerId);
+      if (local?.offlineOnly) return null;
+      console.log(`[refreshLedger] Ledger ${ledgerId} no longer exists — removing locally`);
+      purgeLedgerEverywhere(ledgerId);
+      return { deleted: true };
+    }
     if (!res.ok) return null;
     const data = await res.json();
 
@@ -547,13 +589,13 @@ export function upsertMembers(serverMembers) {
       changed = true;
       continue;
     }
-    // Brand new member — create local record (minimal, just enough to render)
-    const salt = Math.random().toString(36).slice(2);
+    // Brand new member — create local record (minimal, just enough to render).
+    // No passwordHash → NOT a local account (never shows on the sign-in screen).
     const newMember = {
       id: srv.id,
       name: srv.name || 'Unknown',
       color: srv.color || assignDefaultColor(members.map(m => m.color)),
-      salt,
+      salt: '',
       passwordHash: '',
       joinedAt: Date.now(),
     };
@@ -598,30 +640,55 @@ export async function refreshLedgerListMeta() {
   } catch { /* ok */ }
 }
 
+/**
+ * Server-truth reconciliation: for every locally cached ledger, ask the server
+ * whether it still exists and whether this user is still a member. Ledgers
+ * deleted by their admin (or memberships revoked) are purged locally so they
+ * disappear on every device, not just the one that performed the delete.
+ * Returns true if anything changed locally.
+ */
+export async function reconcileLedgersWithServer(userId) {
+  let changed = false;
+  const ledgers = loadLedgers();
+  for (const l of ledgers) {
+    try {
+      const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(l.id)}`);
+      if (res.status === 404) {
+        if (!l.offlineOnly) {
+          // Skip offline-only ledgers: the server never knew them, so 404 is
+          // expected and does NOT mean they were deleted.
+          purgeLedgerEverywhere(l.id);
+          changed = true;
+        }
+        continue;
+      }
+      if (!res.ok) continue; // server unreachable / transient — keep local copy
+      const data = await res.json();
+      const memberIds = Array.isArray(data.member_ids) ? data.member_ids : [];
+      if (!memberIds.includes(userId)) {
+        // This account was removed from the ledger — drop it locally.
+        purgeLedgerEverywhere(l.id);
+        changed = true;
+      }
+    } catch { /* server unreachable — keep local copy */ }
+  }
+  return changed;
+}
+
 // ── Delete Ledger (creator only, soft delete) ──────────────────────────
 
 /** Delete a ledger on the server (soft delete). Only the creator can do this. */
 export async function deleteLedger(ledgerId, userId) {
   // Always remove from local state first (offline-first)
-  const ledgers = loadLedgers().filter(l => l.id !== ledgerId);
-  saveLedgers(ledgers);
-  clearBillsForLedger(ledgerId);
+  purgeLedgerEverywhere(ledgerId);
 
   try {
-    // Fetch the real creator_id from the server to handle UUID normalization mismatches
-    let creatorId = userId;
-    try {
-      const roomRes = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}`);
-      if (roomRes.ok) {
-        const roomData = await roomRes.json();
-        if (roomData.ledger?.created_by) creatorId = roomData.ledger.created_by;
-      }
-    } catch (_) { /* fallback to local userId */ }
-
+    // Ask the server to delete. The backend enforces creator-only using the
+    // real created_by it has on file — the client's user_id is just a claim.
     const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}`, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: creatorId }),
+      body: JSON.stringify({ user_id: userId }),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));

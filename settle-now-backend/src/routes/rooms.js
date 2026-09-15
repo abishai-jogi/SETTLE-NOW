@@ -220,6 +220,8 @@ router.get("/rooms/:id", async (req, res) => {
       [id]
     );
     if (!room.rows.length) {
+      // Also covered: rooms that were soft-deleted — clients treat any 404
+      // here as "this ledger no longer exists" and remove it locally.
       return res.status(404).json({ error: "room_not_found" });
     }
     const roomId = room.rows[0].id;
@@ -269,6 +271,13 @@ router.get("/rooms/lookup/:code", async (req, res) => {
 router.get("/rooms/:id/expenses", async (req, res) => {
   const { id } = req.params;
   try {
+    const roomCheck = await query(
+      "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!roomCheck.rows.length) {
+      return res.status(404).json({ error: "room_not_found" });
+    }
     const expenses = await query(
       `SELECT e.id, e.room_id, e.paid_by, e.amount_cents, e.description,
               e.split_type, e.created_at, e.updated_at,
@@ -317,6 +326,13 @@ router.post("/rooms/:id/expenses", async (req, res) => {
     return res.status(400).json({ error: "expense_id, paid_by, amount, split_among required" });
   }
   try {
+    const roomCheck = await query(
+      "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!roomCheck.rows.length) {
+      return res.status(404).json({ error: "room_not_found" });
+    }
     const now = Date.now();
     const dbExpenseId = isUUID(expense_id) ? expense_id : crypto.randomUUID();
     const amountCents = Math.round(Number(amount) * 100);
@@ -374,17 +390,30 @@ router.delete("/rooms/:id", async (req, res) => {
       return res.status(403).json({ error: "only the ledger creator can delete it" });
     }
     const now = Date.now();
-    // Soft-delete the room
+    // Soft-delete the room itself
     await query(
       "UPDATE rooms SET is_deleted = TRUE, updated_at = $2 WHERE id = $1",
       [id, now]
     );
-    // Soft-delete all memberships
+    // Soft-delete ALL room content so every device's next sync reflects the deletion
+    await query(
+      "UPDATE expenses SET is_deleted = TRUE, updated_at = $2 WHERE room_id = $1 AND is_deleted = FALSE",
+      [id, now]
+    );
+    await query(
+      `UPDATE expense_participants ep SET is_deleted = TRUE, updated_at = $2
+       FROM expenses e WHERE ep.expense_id = e.id AND e.room_id = $1 AND ep.is_deleted = FALSE`,
+      [id, now]
+    );
+    await query(
+      "UPDATE settlements SET is_deleted = TRUE, updated_at = $2 WHERE room_id = $1 AND is_deleted = FALSE",
+      [id, now]
+    );
     await query(
       "UPDATE room_members SET is_deleted = TRUE WHERE room_id = $1 AND is_deleted = FALSE",
       [id]
     );
-    console.log(`[rooms] Ledger ${id} soft-deleted by ${user_id}`);
+    console.log(`[rooms] Ledger ${id} soft-deleted (with all expenses/settlements/memberships) by ${user_id}`);
     res.json({ ok: true });
   } catch (err) {
     console.error("[rooms/delete]", err.message);
@@ -396,6 +425,13 @@ router.delete("/rooms/:id", async (req, res) => {
 router.get("/rooms/:id/balances", async (req, res) => {
   const { id } = req.params;
   try {
+    const roomCheck = await query(
+      "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!roomCheck.rows.length) {
+      return res.status(404).json({ error: "room_not_found" });
+    }
     const expenses = await query(
       `SELECT e.paid_by, e.amount_cents, ep.user_id, ep.share_cents
        FROM expenses e
@@ -428,6 +464,13 @@ router.get("/rooms/:id/balances", async (req, res) => {
 router.delete("/rooms/:id/expenses", async (req, res) => {
   const { id } = req.params;
   try {
+    const roomCheck = await query(
+      "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!roomCheck.rows.length) {
+      return res.status(404).json({ error: "room_not_found" });
+    }
     const now = Date.now();
     await query(
       `UPDATE expenses SET is_deleted = TRUE, updated_at = $2 WHERE room_id = $1 AND is_deleted = FALSE`,
@@ -447,6 +490,13 @@ router.delete("/rooms/:id/expenses", async (req, res) => {
 router.get("/rooms/:id/settlements", async (req, res) => {
   const { id } = req.params;
   try {
+    const roomCheck = await query(
+      "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!roomCheck.rows.length) {
+      return res.status(404).json({ error: "room_not_found" });
+    }
     const rows = await query(
       `SELECT id, room_id, from_user, to_user, amount_cents, created_at
        FROM settlements
@@ -486,7 +536,7 @@ router.post("/rooms/:id/settlements", async (req, res) => {
       return res.status(404).json({ error: "room_not_found" });
     }
     const now = Date.now();
-    const dbId = settlement_id || randomUUID();
+    const dbId = isUUID(settlement_id) ? settlement_id : randomUUID();
     await query(
       `INSERT INTO settlements (id, room_id, from_user, to_user, amount_cents, created_at, updated_at, is_deleted)
        VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE)
@@ -507,6 +557,13 @@ router.post("/rooms/:id/settlements", async (req, res) => {
 router.delete("/rooms/:id/settlements", async (req, res) => {
   const { id } = req.params;
   try {
+    const roomCheck = await query(
+      "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!roomCheck.rows.length) {
+      return res.status(404).json({ error: "room_not_found" });
+    }
     const now = Date.now();
     await query(
       `UPDATE settlements SET is_deleted = TRUE, updated_at = $2 WHERE room_id = $1 AND is_deleted = FALSE`,

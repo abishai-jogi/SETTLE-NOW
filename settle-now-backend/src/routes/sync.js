@@ -255,7 +255,8 @@ const PULL_QUERIES = {
     expenses: {
         sql: `SELECT e.* FROM expenses e
               WHERE e.updated_at > $1 AND e.room_id IN (
-                    SELECT room_id FROM room_members WHERE user_id = $2)
+                    SELECT room_id FROM room_members WHERE user_id = $2 AND is_deleted = FALSE)
+                    AND e.room_id IN (SELECT id FROM rooms WHERE is_deleted = FALSE)
               ORDER BY e.updated_at ASC LIMIT 1000`,
         scoped: true,
     },
@@ -264,14 +265,16 @@ const PULL_QUERIES = {
               FROM expense_participants ep
               JOIN expenses e ON e.id = ep.expense_id
               WHERE ep.updated_at > $1 AND e.room_id IN (
-                    SELECT room_id FROM room_members WHERE user_id = $2)
+                    SELECT room_id FROM room_members WHERE user_id = $2 AND is_deleted = FALSE)
+                    AND e.room_id IN (SELECT id FROM rooms WHERE is_deleted = FALSE)
               ORDER BY ep.updated_at ASC LIMIT 2000`,
         scoped: true,
     },
     settlements: {
         sql: `SELECT s.* FROM settlements s
               WHERE s.updated_at > $1 AND s.room_id IN (
-                    SELECT room_id FROM room_members WHERE user_id = $2)
+                    SELECT room_id FROM room_members WHERE user_id = $2 AND is_deleted = FALSE)
+                    AND s.room_id IN (SELECT id FROM rooms WHERE is_deleted = FALSE)
               ORDER BY s.updated_at ASC LIMIT 1000`,
         scoped: true,
     },
