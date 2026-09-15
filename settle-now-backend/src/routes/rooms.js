@@ -520,4 +520,22 @@ router.delete("/rooms/:id/settlements", async (req, res) => {
   }
 });
 
+// ── ONE-TIME production data wipe (temporary — remove after use) ───────
+// Guarded by WIPE_TOKEN env var; truncates all app data tables in FK-safe order.
+router.post("/admin/wipe", async (req, res) => {
+  const token = req.get("x-wipe-token") || req.body?.token;
+  const expected = process.env.WIPE_TOKEN;
+  if (!expected || token !== expected) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  try {
+    await query("TRUNCATE conflict_log, settlements, expense_participants, expenses, room_members, rooms, users CASCADE");
+    console.log("[admin/wipe] ALL production data truncated by token holder");
+    res.json({ ok: true, wiped: true, at: Date.now() });
+  } catch (err) {
+    console.error("[admin/wipe]", err.message);
+    res.status(500).json({ error: "internal", detail: err.message });
+  }
+});
+
 export default router;
