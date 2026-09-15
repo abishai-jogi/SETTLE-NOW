@@ -37,26 +37,17 @@ export const groupTotal = (bills) =>
   round2(bills.reduce((a, b) => a + b.amount, 0));
 
 /**
- * Label for a calendar month given "now" — the pure, testable core of the
- * history labeling. Distance is measured in whole calendar months from the
- * current (possibly incomplete) month:
- *   0 = current month (in progress → null, never listed)
- *   1 = last completed month → "Last Month"
- *   2 → "1", 3 → "2", ... so labels auto-shift when a new month begins.
+ * Whole calendar months from month a to month b (b - a).
+ * Negative = b is before a (a newer than b).
  */
-export function monthLabelFor(monthDate, now = new Date()) {
-  const monthsAway =
-    (monthDate.getFullYear() - now.getFullYear()) * 12 +
-    (monthDate.getMonth() - now.getMonth());
-  if (monthsAway >= 0) return null; // current or future month → not completed
-  const completedBack = -monthsAway; // 1 = last completed month
-  return completedBack === 1 ? "Last Month" : String(completedBack - 1);
+function monthIndexDistance(a, b) {
+  return (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
 }
 
 /**
  * Monthly total history: bucket bills by calendar month, sum per month,
- * and label them dynamically (most recent completed month = "Last Month",
- * older ones numbered 1, 2, 3... from the current month backwards).
+ * and label them dynamically — oldest completed month shown = "1",
+ * increasing upward, last completed month = "Last Month".
  *
  * Returns entries newest-first: [{ monthOf, label, total }].
  * Only completed months that actually have expenses are included.
@@ -70,17 +61,28 @@ export function monthlyHistory(bills, now = new Date()) {
     buckets.set(key, (buckets.get(key) || 0) + b.amount);
   }
 
-  // One entry per bucket, labeled via monthLabelFor
-  const entries = [];
+  // Keep completed months only, oldest first, so the oldest is "1" and
+  // numbering increases upward (calendar-distance based, gap-safe).
+  const rawEntries = [];
   for (const [key, sum] of buckets) {
     const [year, month] = key.split("|").map(Number);
     const firstOfMonth = new Date(year, month, 1);
-    const label = monthLabelFor(firstOfMonth, now);
-    if (label === null) continue; // current (in-progress) or future month
-    entries.push({ monthOf: firstOfMonth, key, label, total: round2(sum) });
+    // monthIndexDistance(a=now, b=month): 0 = current month, positive = future
+    const fromNow = monthIndexDistance(now, firstOfMonth);
+    if (fromNow >= 0) continue; // current (in-progress) or future month
+    rawEntries.push({ monthOf: firstOfMonth, key, total: round2(sum) });
   }
+  rawEntries.sort((a, b) => a.monthOf.getTime() - b.monthOf.getTime());
 
-  // Newest-first
+  const entries = rawEntries.map((e) => ({
+    ...e,
+    label:
+      e.monthOf.getTime() === rawEntries[rawEntries.length - 1].monthOf.getTime()
+        ? "Last Month" // newest completed month
+        : String(monthIndexDistance(rawEntries[0].monthOf, e.monthOf) + 1), // 1, 2, 3…
+  }));
+
+  // Newest-first for display
   entries.sort((a, b) => b.monthOf.getTime() - a.monthOf.getTime());
   return entries;
 }
