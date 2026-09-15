@@ -18,6 +18,25 @@ const API_BASE = (() => {
   return `${loc.protocol}//${loc.host}`;
 })();
 
+// ── One-time cache reset ──────────────────────────────────────────────
+// Bump CACHE_VERSION to wipe EVERY device's saved logins and cached data on
+// next load — used to give the deployed app a fresh start after a server wipe.
+// Each device runs this exactly once, then behaves normally.
+const CACHE_VERSION = 4;
+const CACHE_FLAG_KEY = "settle-now.cacheVersion";
+
+function ensureCacheVersion() {
+  try {
+    if (Number(localStorage.getItem(CACHE_FLAG_KEY)) === CACHE_VERSION) return;
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith("settle-now.")) localStorage.removeItem(key);
+    }
+    localStorage.setItem(CACHE_FLAG_KEY, String(CACHE_VERSION));
+  } catch { /* storage unavailable — nothing to reset */ }
+}
+ensureCacheVersion();
+
 // ── Members ────────────────────────────────────────────────────────────
 
 const validMember = (m) =>
