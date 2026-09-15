@@ -1,7 +1,12 @@
 const round2 = (n) => Math.round(n * 100) / 100;
 
-/** Net balance per member within a set of bills. Positive = owed money. */
-export function netBalances(bills, members) {
+/**
+ * Net balance per member. Positive = owed money.
+ * Expenses create debt; recorded settlements reduce it — a settlement of X
+ * from A to B is exactly A paying X toward what they owe B.
+ * settlements: [{ fromUserId, toUserId, amount }]
+ */
+export function netBalances(bills, members, settlements = []) {
   const bal = Object.fromEntries(members.map((m) => [m.id, 0]));
   for (const b of bills) {
     for (const id of b.splitAmongIds) if (!(id in bal)) bal[id] = 0;
@@ -12,6 +17,12 @@ export function netBalances(bills, members) {
     const share = b.amount / n;
     for (const id of b.splitAmongIds) bal[id] -= share;
     if (b.payerId in bal) bal[b.payerId] += b.amount;
+  }
+  for (const s of settlements) {
+    if (!(s.fromUserId in bal)) bal[s.fromUserId] = 0;
+    if (!(s.toUserId in bal)) bal[s.toUserId] = 0;
+    bal[s.fromUserId] += s.amount; // payer's debt decreases
+    bal[s.toUserId] -= s.amount;   // receiver is owed less
   }
   return Object.fromEntries(Object.entries(bal).map(([id, v]) => [id, round2(v)]));
 }

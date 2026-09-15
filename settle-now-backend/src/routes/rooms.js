@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { query } from "../db.js";
 import crypto from "node:crypto";
+const { randomUUID } = crypto;
 
 const router = Router();
 
@@ -436,6 +437,85 @@ router.delete("/rooms/:id/expenses", async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error("[rooms/expenses/clear]", err.message);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// ── Settlements (recorded debt payments between members) ────────────────
+
+// GET all settlements for a room
+router.get("/rooms/:id/settlements", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const rows = await query(
+      `SELECT id, room_id, from_user, to_user, amount_cents, created_at
+       FROM settlements
+       WHERE room_id = $1 AND is_deleted = FALSE
+       ORDER BY created_at ASC`,
+      [id]
+    );
+    res.json({
+      settlements: rows.rows.map((r) => ({
+        id: r.id,
+        fromUserId: r.from_user,
+        toUserId: r.to_user,
+        amount: Math.round(r.amount_cents) / 100,
+        timestamp: Number(r.created_at),
+      })),
+    });
+  } catch (err) {
+    console.error("[rooms/settlements/list]", err.message);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// POST a settlement — from_user paid to_user the given amount
+router.post("/rooms/:id/settlements", async (req, res) => {
+  const { id } = req.params;
+  const { settlement_id, from_user, to_user, amount } = req.body ?? {};
+  const amountNum = Number(amount);
+  if (!from_user || !to_user || !Number.isFinite(amountNum) || amountNum <= 0) {
+    return res.status(400).json({ error: "from_user, to_user and positive amount required" });
+  }
+  try {
+    const room = await query(
+      "SELECT id FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!room.rows.length) {
+      return res.status(404).json({ error: "room_not_found" });
+    }
+    const now = Date.now();
+    const dbId = settlement_id || randomUUID();
+    await query(
+      `INSERT INTO settlements (id, room_id, from_user, to_user, amount_cents, created_at, updated_at, is_deleted)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE)
+       ON CONFLICT (id) DO UPDATE SET
+         amount_cents = EXCLUDED.amount_cents,
+         updated_at = EXCLUDED.updated_at`,
+      [dbId, id, from_user, to_user, Math.round(amountNum * 100), now, now]
+    );
+    console.log(`[rooms/settlements] ${from_user} paid ${to_user} ₹${amountNum} in room ${id}`);
+    res.json({ ok: true, settlement_id: dbId });
+  } catch (err) {
+    console.error("[rooms/settlements/create]", err.message);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// DELETE (soft) all settlements in a room
+router.delete("/rooms/:id/settlements", async (req, res) => {
+  const { id } = req.params;
+  try {
+    const now = Date.now();
+    await query(
+      `UPDATE settlements SET is_deleted = TRUE, updated_at = $2 WHERE room_id = $1 AND is_deleted = FALSE`,
+      [id, now]
+    );
+    console.log(`[rooms/settlements] Cleared all settlements in room ${id}`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[rooms/settlements/clear]", err.message);
     res.status(500).json({ error: "internal" });
   }
 });

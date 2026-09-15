@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { CHIP_AMOUNTS } from "../config/people.js";
 import { contrastInk, dayKey, dayLabel, draftMoney, money } from "../lib/format.js";
 import { netBalances, simplifyDebts, sumSince } from "../lib/ledger.js";
-import { appendBill, clearBillsForLedger, clearBillsOnServer } from "../lib/storage.js";
+import { appendBill, clearBillsForLedger, clearBillsOnServer, appendSettlement, loadSettlements, mergeSettlementsFromServer } from "../lib/storage.js";
 import { genUuid } from "../lib/uid.js";
 import MessageBubble from "./MessageBubble.jsx";
 import Numpad from "./Numpad.jsx";
@@ -44,18 +44,145 @@ function SettlementBadge({ status, onClick }) {
 }
 
 /* ── Settlement Overlay ──────────────────────────────────────────────── */
-function SettlementOverlay({ user, members, transfers, netCents, onClose }) {
+function SettlementOverlay({ user, members, transfers, netCents, onClose, onRecordSettlement }) {
   const myNet = netCents[user.id] || 0;
   const iOwe = transfers.filter((t) => t.from === user.id);
   const owedToMe = transfers.filter((t) => t.to === user.id);
   const isSettled = Math.abs(myNet) < 0.005 && iOwe.length === 0 && owedToMe.length === 0;
   const nameOf = (id) => members.find((m) => m.id === id)?.name || "Unknown";
 
+  // Which transfer row is showing the two-option choice ("enter amount" / "totally cleared")
+  const [choosing, setChoosing] = useState(null); // { from, to, amount } | null
+  const [showPayNumpad, setShowPayNumpad] = useState(false);
+  const [payDraft, setPayDraft] = useState("");
+  const canPay = payDraft !== "" && Number.isFinite(Number(payDraft)) && Number(payDraft) > 0;
+
+  const chooseRow = (t) => {
+    setChoosing(t);
+    setPayDraft("");
+    setShowPayNumpad(false);
+  };
+
+  const recordPart = () => {
+    if (!choosing || !canPay) return;
+    onRecordSettlement({ from: choosing.from, to: choosing.to, amount: Number(payDraft) });
+    setChoosing(null);
+    setShowPayNumpad(false);
+    setPayDraft("");
+  };
+
+  const recordFull = () => {
+    if (!choosing) return;
+    onRecordSettlement({ from: choosing.from, to: choosing.to, amount: choosing.amount });
+    setChoosing(null);
+    setPayDraft("");
+  };
+
+  const row = (t, direction) => {
+    const otherId = direction === "owe" ? t.to : t.from;
+    const isChoosing = choosing && choosing.from === t.from && choosing.to === t.to;
+    return (
+      <div key={`${direction}-${t.from}-${t.to}`} className="space-y-1.5">
+        <button
+          type="button"
+          onClick={() => (isChoosing ? setChoosing(null) : chooseRow(t))}
+          className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition active:scale-[0.99]"
+          style={{ backgroundColor: direction === "owe" ? "rgba(122,30,42,0.06)" : "rgba(79,111,82,0.06)" }}
+        >
+          <span className="flex-1 text-sm text-charcoal">
+            {nameOf(otherId)}
+            {direction === "owe" ? " — you pay" : " — pays you"}
+          </span>
+          <span
+            className="font-display text-sm font-semibold"
+            style={{ color: direction === "owe" ? "#7a1e2a" : "#4f6f52" }}
+          >
+            {money(t.amount)}
+          </span>
+          <svg className="h-3.5 w-3.5 shrink-0 text-faded" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path strokeLinecap="round" strokeLinejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5" />
+          </svg>
+        </button>
+
+        {isChoosing && (
+          <div className="pop-in mx-1 space-y-2 rounded-lg border border-gold/30 bg-ivory p-3">
+            <p className="text-[9px] uppercase tracking-[0.25em] text-faded">
+              How much is cleared with {nameOf(otherId)}?
+            </p>
+            {!showPayNumpad ? (
+              <div className="grid grid-cols-1 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowPayNumpad(true)}
+                  className="flex items-center justify-center gap-2 rounded-lg border border-gold/50 bg-ivory px-3 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] text-charcoal shadow-sm transition hover:bg-gold/10 active:scale-[0.99]"
+                >
+                  {/* keypad icon */}
+                  <svg className="h-4 w-4 text-gold" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="2" y="2" width="4" height="4" rx="1" /><rect x="10" y="2" width="4" height="4" rx="1" /><rect x="18" y="2" width="4" height="4" rx="1" />
+                    <rect x="2" y="10" width="4" height="4" rx="1" /><rect x="10" y="10" width="4" height="4" rx="1" /><rect x="18" y="10" width="4" height="4" rx="1" />
+                    <rect x="2" y="18" width="4" height="4" rx="1" /><rect x="10" y="18" width="4" height="4" rx="1" /><rect x="18" y="18" width="4" height="4" rx="1" />
+                  </svg>
+                  Cleared amount
+                </button>
+                <button
+                  type="button"
+                  onClick={recordFull}
+                  className="flex items-center justify-center gap-2 rounded-lg bg-sage px-3 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] text-ivory shadow-sm transition hover:opacity-90 active:scale-[0.99]"
+                >
+                  ✓ Totally cleared
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-charcoal/20 bg-ivory px-3 py-2 shadow-sm">
+                  <span className="whitespace-nowrap text-[10px] uppercase tracking-[0.25em] text-faded">
+                    You paid
+                  </span>
+                  <input
+                    readOnly
+                    tabIndex={-1}
+                    inputMode="none"
+                    value={draftMoney(payDraft)}
+                    placeholder="₹ 0"
+                    onMouseDown={(e) => e.preventDefault()}
+                    className="w-full min-w-0 bg-transparent text-right font-display text-xl tabular-nums text-charcoal outline-none placeholder:text-faded/50"
+                  />
+                </div>
+                <Numpad
+                  onKey={(k) =>
+                    setPayDraft((d) => {
+                      if (k === "back") return d.slice(0, -1);
+                      if (k === ".") {
+                        if (d.includes(".")) return d;
+                        return d === "" ? "0." : d + ".";
+                      }
+                      if (!/^\d$/.test(k)) return d;
+                      if (d.includes(".")) {
+                        return d.length - d.indexOf(".") <= 2 ? d + k : d;
+                      }
+                      if (d.length >= 7) return d;
+                      if (d === "0") return k;
+                      return d + k;
+                    })
+                  }
+                  onSend={recordPart}
+                  canSend={canPay}
+                  accentHex="#4f6f52"
+                  label="Cleared"
+                />
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
       <div className="absolute inset-0 bg-charcoal/50 backdrop-blur-sm" />
       <div
-        className="pop-in relative z-10 mx-4 w-full max-w-sm rounded-2xl border border-gold/30 bg-ivory p-6 shadow-xl"
+        className="pop-in relative z-10 mx-4 max-h-[85vh] w-full max-w-sm overflow-y-auto rounded-2xl border border-gold/30 bg-ivory p-6 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-4 flex items-center justify-between">
@@ -84,25 +211,18 @@ function SettlementOverlay({ user, members, transfers, netCents, onClose }) {
             {iOwe.length > 0 && (
               <div>
                 <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-wine">You owe</p>
-                {iOwe.map((t, i) => (
-                  <div key={i} className="flex items-center gap-3 rounded-lg bg-wine/5 px-3 py-2">
-                    <span className="flex-1 text-sm text-charcoal">{nameOf(t.to)}</span>
-                    <span className="font-display text-sm font-semibold text-wine">{money(t.amount)}</span>
-                  </div>
-                ))}
+                <div className="space-y-1.5">{iOwe.map((t) => row(t, "owe"))}</div>
               </div>
             )}
             {owedToMe.length > 0 && (
               <div>
                 <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-sage">You're owed</p>
-                {owedToMe.map((t, i) => (
-                  <div key={i} className="flex items-center gap-3 rounded-lg bg-sage/5 px-3 py-2">
-                    <span className="flex-1 text-sm text-charcoal">{nameOf(t.from)}</span>
-                    <span className="font-display text-sm font-semibold text-sage">{money(t.amount)}</span>
-                  </div>
-                ))}
+                <div className="space-y-1.5">{owedToMe.map((t) => row(t, "owed"))}</div>
               </div>
             )}
+            <p className="pt-1 text-center text-[9px] italic text-faded">
+              Tap a row to record a payment and update balances.
+            </p>
           </div>
         )}
       </div>
@@ -220,9 +340,10 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
   const [draft, setDraft] = useState("");
   const [showSettlement, setShowSettlement] = useState(false);
   const [showNumpad, setShowNumpad] = useState(false);
+  const [settlements, setSettlements] = useState(() => loadSettlements(ledger.id));
   const endRef = useRef(null);
 
-  const balances = netBalances(bills, members);
+  const balances = netBalances(bills, members, settlements);
   const balance = balances[user.id] || 0;
   const transfers = simplifyDebts(balances);
   const monthlyAvg = sumSince(bills, user.id, 30);
@@ -237,6 +358,25 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [bills.length]);
+
+  // Pull settlements recorded on other devices (merged into local cache)
+  useEffect(() => {
+    let alive = true;
+    mergeSettlementsFromServer(ledger.id).then((merged) => {
+      if (alive && merged) setSettlements(merged);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [ledger.id]);
+
+  // Record a debt payment: updates balances instantly (local) + syncs to server
+  const recordSettlement = ({ from, to, amount }) => {
+    if (!(amount > 0)) return;
+    appendSettlement({ ledgerId: ledger.id, fromUserId: from, toUserId: to, amount });
+    setSettlements(loadSettlements(ledger.id));
+    onRefreshBills();
+  };
 
   const send = () => {
     const amount = Number(draft);
@@ -370,6 +510,7 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
           transfers={transfers}
           netCents={balances}
           onClose={() => setShowSettlement(false)}
+          onRecordSettlement={recordSettlement}
         />
       )}
 

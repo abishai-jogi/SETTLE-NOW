@@ -4,6 +4,7 @@ const MEMBERS_KEY = "settle-now.members.v3";
 export const BILLS_KEY = "settle-now.bills.v3";
 const USER_KEY = "settle-now.user.v2";
 const LEDGERS_KEY = "settle-now.ledgers.v1";
+const SETTLEMENTS_KEY = "settle-now.settlements.v1";
 
 // API base — priority:
 // 1. VITE_API_BASE env var set at build time (used for the Vercel production build)
@@ -165,6 +166,112 @@ const loadAllBills = loadAllBillsLocal;
 export function clearBillsForLedger(ledgerId) {
   const all = loadAllBills().filter((b) => b.ledgerId !== ledgerId);
   localStorage.setItem(BILLS_KEY, JSON.stringify(all));
+}
+
+// ── Settlements (recorded debt payments) ─────────────────────────────
+
+function loadAllSettlements() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(SETTLEMENTS_KEY));
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+/** All recorded settlements for one ledger (local cache). */
+export function loadSettlements(ledgerId) {
+  return loadAllSettlements().filter((s) => s.ledgerId === ledgerId);
+}
+
+/**
+ * Record a settlement: `fromUserId` paid `amount` to `toUserId`.
+ * Saves locally and pushes to the server for cross-device sync (fire-and-forget).
+ */
+export function appendSettlement({ ledgerId, fromUserId, toUserId, amount }) {
+  const settlement = {
+    id: genUuid(),
+    ledgerId,
+    fromUserId,
+    toUserId,
+    amount: Math.round(amount * 100) / 100,
+    timestamp: Date.now(),
+  };
+  const all = loadAllSettlements();
+  all.push(settlement);
+  localStorage.setItem(SETTLEMENTS_KEY, JSON.stringify(all));
+  pushSettlementToServer(settlement).catch((err) =>
+    console.error('[appendSettlement] server push failed:', err.message)
+  );
+  return settlement;
+}
+
+async function pushSettlementToServer(s) {
+  try {
+    const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(s.ledgerId)}/settlements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        settlement_id: s.id,
+        from_user: s.fromUserId,
+        to_user: s.toUserId,
+        amount: s.amount,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      console.error('[pushSettlementToServer] error:', res.status, body);
+    }
+  } catch (err) {
+    console.error('[pushSettlementToServer] fetch failed:', err.message);
+  }
+}
+
+/**
+ * Merge server settlements into the local cache (cross-device sync).
+ * Returns the full local list for this ledger after merging, or null on failure.
+ */
+export async function mergeSettlementsFromServer(ledgerId) {
+  try {
+    const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}/settlements`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!Array.isArray(data.settlements)) return null;
+
+    const all = loadAllSettlements();
+    const knownIds = new Set(all.map((s) => s.id));
+    let changed = false;
+    for (const srv of data.settlements) {
+      if (!srv?.id || knownIds.has(srv.id)) continue;
+      // Coerce types — server may return strings from PostgreSQL
+      const amount = typeof srv.amount === 'string' ? Number(srv.amount) : srv.amount;
+      const ts = typeof srv.timestamp === 'string' ? Number(srv.timestamp) : srv.timestamp;
+      all.push({
+        id: srv.id,
+        ledgerId,
+        fromUserId: srv.fromUserId,
+        toUserId: srv.toUserId,
+        amount,
+        timestamp: ts,
+      });
+      knownIds.add(srv.id);
+      changed = true;
+    }
+    if (changed) localStorage.setItem(SETTLEMENTS_KEY, JSON.stringify(all));
+    return all.filter((s) => s.ledgerId === ledgerId);
+  } catch (err) {
+    console.error('[mergeSettlementsFromServer] failed:', err.message);
+    return null;
+  }
+}
+
+/** Remove all settlements for a ledger locally AND on the server. */
+export function clearSettlementsForLedger(ledgerId) {
+  const all = loadAllSettlements().filter((s) => s.ledgerId !== ledgerId);
+  localStorage.setItem(SETTLEMENTS_KEY, JSON.stringify(all));
+  fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}/settlements`, { method: 'DELETE' }).catch(
+    (err) => console.error('[clearSettlementsForLedger] server clear failed:', err.message)
+  );
 }
 
 // ── Ledgers ────────────────────────────────────────────────────────────
