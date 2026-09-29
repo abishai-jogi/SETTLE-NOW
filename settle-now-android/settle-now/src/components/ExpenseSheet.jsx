@@ -1,8 +1,9 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { CHIP_AMOUNTS } from "../config/people.js";
-import { draftMoney } from "../lib/format.js";
+import { contrastInk, draftMoney } from "../lib/format.js";
 import { toPaise, formatPaise } from "../lib/money.js";
 import { allocate } from "../lib/splitEngine.js";
+import { defaultValues } from "../lib/splitDefaults.js";
 import Avatar from "./Avatar.jsx";
 import Numpad from "./Numpad.jsx";
 
@@ -28,6 +29,7 @@ const MODES = [
  */
 export default function ExpenseSheet({ user, members, onSend, onClose }) {
   const [draft, setDraft] = useState(""); // rupee-string amount, owned here
+  const [step, setStep] = useState("amount"); // "amount" → "split"
   const [mode, setMode] = useState("EQUAL");
   const [participantIds, setParticipantIds] = useState(() => members.map((m) => m.id));
   const [payerParticipates, setPayerParticipates] = useState(true);
@@ -35,6 +37,7 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
   const [exactDrafts, setExactDrafts] = useState({});
   const [percentDrafts, setPercentDrafts] = useState({});
   const [weightDrafts, setWeightDrafts] = useState({});
+  const [edited, setEdited] = useState({ EXACT: false, PERCENT: false, SHARES: false });
 
   const amountPaise = toPaise(draft || "0");
   const amountValid = Number.isSafeInteger(amountPaise) && amountPaise > 0;
@@ -43,6 +46,49 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
     setParticipantIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
     );
+  };
+
+  /** The payer toggle and the participant list are the same decision — keep
+   *  them in sync so the two controls can never disagree. */
+  const setPayerIn = (joins) => {
+    setPayerParticipates(joins);
+    setParticipantIds((prev) =>
+      joins
+        ? prev.includes(user.id) ? prev : [...prev, user.id]
+        : prev.filter((x) => x !== user.id)
+    );
+  };
+
+  const setModeValue = (id, v) => {
+    if (mode === "EXACT") { setExactDrafts((d) => ({ ...d, [id]: v })); setEdited((e) => ({ ...e, EXACT: true })); }
+    else if (mode === "PERCENT") { setPercentDrafts((d) => ({ ...d, [id]: v })); setEdited((e) => ({ ...e, PERCENT: true })); }
+    else { setWeightDrafts((d) => ({ ...d, [id]: v })); setEdited((e) => ({ ...e, SHARES: true })); }
+  };
+
+  // Seed defaults whenever the mode, the participants or (for EXACT) the
+  // amount change — but never overwrite a number the user typed themselves.
+  useEffect(() => {
+    if (mode === "EQUAL" || participantIds.length === 0) return;
+    const fill = (prev, key) => {
+      const values = defaultValues(mode, participantIds, amountPaise);
+      const next = {};
+      for (const id of participantIds) {
+        // untouched field → take the default; user-typed value → keep it
+        next[id] = edited[key] ? (prev[id] ?? values[id] ?? "") : (values[id] ?? "");
+      }
+      return next;
+    };
+    if (mode === "EXACT") setExactDrafts((p) => fill(p, "EXACT"));
+    if (mode === "PERCENT") setPercentDrafts((p) => fill(p, "PERCENT"));
+    if (mode === "SHARES") setWeightDrafts((p) => fill(p, "SHARES"));
+  }, [mode, participantIds, amountPaise, edited]);
+
+  /** Back to defaults for the active mode. */
+  const resetDefaults = () => {
+    const values = defaultValues(mode, participantIds, amountPaise);
+    if (mode === "EXACT") { setExactDrafts(values); setEdited((e) => ({ ...e, EXACT: false })); }
+    if (mode === "PERCENT") { setPercentDrafts(values); setEdited((e) => ({ ...e, PERCENT: false })); }
+    if (mode === "SHARES") { setWeightDrafts(values); setEdited((e) => ({ ...e, SHARES: false })); }
   };
 
   const num = (s) => {
@@ -116,9 +162,7 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
           value={value}
           onChange={(e) => {
             const v = e.target.value;
-            if (v === "" || /^\d{0,7}(\.\d{0,2})?$/.test(v)) {
-              setExactDrafts((d) => ({ ...d, [id]: v }));
-            }
+            if (v === "" || /^\d{0,7}(\.\d{0,2})?$/.test(v)) setModeValue(id, v);
           }}
           placeholder="0.00"
           className="w-24 rounded-md border border-charcoal/20 bg-ivory px-2 py-1 text-right text-sm tabular-nums text-charcoal outline-none focus:border-gold"
@@ -133,9 +177,7 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
           value={value}
           onChange={(e) => {
             const v = e.target.value;
-            if (v === "" || /^\d{0,3}(\.\d{0,2})?$/.test(v)) {
-              setPercentDrafts((d) => ({ ...d, [id]: v }));
-            }
+            if (v === "" || /^\d{0,3}(\.\d{0,2})?$/.test(v)) setModeValue(id, v);
           }}
           placeholder="%"
           className="w-20 rounded-md border border-charcoal/20 bg-ivory px-2 py-1 text-right text-sm tabular-nums text-charcoal outline-none focus:border-gold"
@@ -149,9 +191,7 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
         value={value}
         onChange={(e) => {
           const v = e.target.value;
-          if (v === "" || /^\d{0,4}(\.\d{0,2})?$/.test(v)) {
-            setWeightDrafts((d) => ({ ...d, [id]: v }));
-          }
+          if (v === "" || /^\d{0,4}(\.\d{0,2})?$/.test(v)) setModeValue(id, v);
         }}
         placeholder="×"
         className="w-16 rounded-md border border-charcoal/20 bg-ivory px-2 py-1 text-right text-sm tabular-nums text-charcoal outline-none focus:border-gold"
@@ -171,57 +211,83 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
         </div>
 
         <div className="mx-auto max-w-3xl space-y-3 px-3 pb-5 pt-2">
-          {/* Chips + amount field + numpad (unchanged behaviour) */}
-          <div className="no-scrollbar flex gap-1.5 overflow-x-auto">
-            {CHIP_AMOUNTS.map((amt) => (
-              <button
-                key={amt}
-                type="button"
-                onClick={() => setDraft(String(amt))}
-                className="shrink-0 rounded-full border border-gold/50 bg-ivory px-4 py-1.5 text-sm text-ink shadow-sm transition hover:bg-gold/15 active:scale-95"
-              >
-                ₹{amt}
-              </button>
-            ))}
-          </div>
+          {/* ── Step 1: the amount ─────────────────────────────────────── */}
+          {step === "amount" ? (
+            <>
+              <div className="no-scrollbar flex gap-1.5 overflow-x-auto">
+                {CHIP_AMOUNTS.map((amt) => (
+                  <button
+                    key={amt}
+                    type="button"
+                    onClick={() => setDraft(String(amt))}
+                    className="shrink-0 rounded-full border border-gold/50 bg-ivory px-4 py-1.5 text-sm text-ink shadow-sm transition hover:bg-gold/15 active:scale-95"
+                  >
+                    ₹{amt}
+                  </button>
+                ))}
+              </div>
 
-          <div className="flex items-center justify-between gap-3 rounded-lg border border-charcoal/20 bg-ivory px-4 py-2 shadow-sm">
-            <span className="whitespace-nowrap text-[10px] uppercase tracking-[0.25em] text-faded">
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-charcoal/20 bg-ivory px-4 py-2 shadow-sm">
+                <span className="whitespace-nowrap text-[10px] uppercase tracking-[0.25em] text-faded">
+                  {user.name} pays
+                </span>
+                <input
+                  readOnly
+                  tabIndex={-1}
+                  inputMode="none"
+                  value={draftMoney(draft)}
+                  placeholder="₹ 0"
+                  onMouseDown={(e) => e.preventDefault()}
+                  className="w-full min-w-0 bg-transparent text-right font-display text-2xl tabular-nums text-charcoal outline-none placeholder:text-faded/50"
+                />
+              </div>
+
+              <Numpad
+                onKey={(k) =>
+                  setDraft((d) => {
+                    if (k === "back") return d.slice(0, -1);
+                    if (k === ".") {
+                      if (d.includes(".")) return d;
+                      return d === "" ? "0." : d + ".";
+                    }
+                    if (!/^\d$/.test(k)) return d;
+                    if (d.includes(".")) {
+                      return d.length - d.indexOf(".") <= 2 ? d + k : d;
+                    }
+                    if (d.length >= 7) return d;
+                    if (d === "0") return k;
+                    return d + k;
+                  })
+                }
+                /* Amount is done → reveal the splitting options, nothing is
+                   recorded yet. */
+                onSend={() => setStep("split")}
+                canSend={amountValid}
+                accentHex={user.color}
+                label={amountValid ? "Split this" : "Enter amount"}
+              />
+            </>
+          ) : (
+            <>
+          {/* ── Step 2: who and how ───────────────────────────────────── */}
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-charcoal/20 bg-ivory px-4 py-2.5 shadow-sm">
+            <button
+              type="button"
+              onClick={() => setStep("amount")}
+              className="flex shrink-0 items-center gap-1 text-faded transition hover:text-charcoal"
+              aria-label="Back to amount"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5" />
+              </svg>
+            </button>
+            <span className="min-w-0 flex-1 truncate text-sm text-charcoal">
               {user.name} pays
             </span>
-            <input
-              readOnly
-              tabIndex={-1}
-              inputMode="none"
-              value={draftMoney(draft)}
-              placeholder="₹ 0"
-              onMouseDown={(e) => e.preventDefault()}
-              className="w-full min-w-0 bg-transparent text-right font-display text-2xl tabular-nums text-charcoal outline-none placeholder:text-faded/50"
-            />
+            <span className="font-display text-lg tabular-nums text-charcoal">
+              {draftMoney(draft)}
+            </span>
           </div>
-
-          <Numpad
-            onKey={(k) =>
-              setDraft((d) => {
-                if (k === "back") return d.slice(0, -1);
-                if (k === ".") {
-                  if (d.includes(".")) return d;
-                  return d === "" ? "0." : d + ".";
-                }
-                if (!/^\d$/.test(k)) return d;
-                if (d.includes(".")) {
-                  return d.length - d.indexOf(".") <= 2 ? d + k : d;
-                }
-                if (d.length >= 7) return d;
-                if (d === "0") return k;
-                return d + k;
-              })
-            }
-            onSend={send}
-            canSend={!blocked}
-            accentHex={user.color}
-            label={amountValid ? `Record ${draftMoney(draft)}` : "Record payment"}
-          />
 
           {/* Split mode segmented control */}
           <div>
@@ -253,7 +319,7 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
             <input
               type="checkbox"
               checked={payerParticipates}
-              onChange={(e) => setPayerParticipates(e.target.checked)}
+              onChange={(e) => setPayerIn(e.target.checked)}
               className="h-4 w-4 accent-[#4f6f52]"
             />
           </label>
@@ -300,9 +366,18 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
           {/* Per-mode share editor + live preview */}
           {mode !== "EQUAL" && participantList.length > 0 && (
             <div className="rounded-lg border border-charcoal/15 bg-ivory/80 p-3">
-              <p className="mb-2 text-[9px] uppercase tracking-[0.25em] text-faded">
-                {mode === "EXACT" ? "Exact amounts" : mode === "PERCENT" ? "Percentages" : "Weights"}
-              </p>
+              <div className="mb-2 flex items-baseline justify-between">
+                <p className="text-[9px] uppercase tracking-[0.25em] text-faded">
+                  {mode === "EXACT" ? "Exact amounts" : mode === "PERCENT" ? "Percentages" : "Weights"}
+                </p>
+                <button
+                  type="button"
+                  onClick={resetDefaults}
+                  className="text-[9px] uppercase tracking-[0.2em] text-gold transition hover:text-wine"
+                >
+                  reset
+                </button>
+              </div>
               <div className="space-y-1.5">
                 {participantList.map((m) => {
                   const row = preview?.ok
@@ -349,6 +424,27 @@ export default function ExpenseSheet({ user, members, onSend, onClose }) {
                     ? "Exact amounts must add up to the total before recording."
                     : ""}
             </p>
+          )}
+
+          {/* Proceed — the split is only recorded from here */}
+          <div className="sticky bottom-0 -mx-3 mt-1 border-t border-charcoal/10 bg-parchment/95 px-3 pb-1 pt-3 backdrop-blur-sm">
+            <button
+              type="button"
+              onClick={send}
+              disabled={blocked}
+              className="flex w-full items-center justify-center gap-2 rounded-lg py-3.5 text-xs font-semibold uppercase tracking-[0.25em] shadow transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
+              style={{
+                backgroundColor: blocked ? "rgba(115,104,89,0.35)" : user.color,
+                color: blocked ? "rgba(246,241,231,0.6)" : contrastInk(user.color),
+              }}
+            >
+              Record {draftMoney(draft)}
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z" />
+              </svg>
+            </button>
+          </div>
+            </>
           )}
         </div>
       </div>
