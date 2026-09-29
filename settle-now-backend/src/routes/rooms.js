@@ -1,5 +1,7 @@
 import { Router } from "express";
-import { query } from "../db.js";
+import { query, withTransaction } from "../db.js";
+import { allocate } from "../lib/splitEngine.js";
+import { toPaise } from "../lib/money.js";
 import crypto from "node:crypto";
 const { randomUUID } = crypto;
 
@@ -267,7 +269,9 @@ router.get("/rooms/lookup/:code", async (req, res) => {
   }
 });
 
-// ── GET expenses for a room ────────────────────────────────────────────
+// ── GET expenses for a room ──────────────────────────────────────────
+// Returns split metadata (split_type, payer_participates) and the RESOLVED
+// per-user shares so clients never re-derive them.
 router.get("/rooms/:id/expenses", async (req, res) => {
   const { id } = req.params;
   try {
@@ -280,7 +284,7 @@ router.get("/rooms/:id/expenses", async (req, res) => {
     }
     const expenses = await query(
       `SELECT e.id, e.room_id, e.paid_by, e.amount_cents, e.description,
-              e.split_type, e.created_at, e.updated_at,
+              e.split_type, e.payer_participates, e.created_at, e.updated_at,
               u.name AS payer_name, u.color AS payer_color
        FROM expenses e
        JOIN users u ON u.id = e.paid_by
@@ -288,29 +292,45 @@ router.get("/rooms/:id/expenses", async (req, res) => {
        ORDER BY e.created_at ASC`,
       [id]
     );
-    // Fetch participants for each expense
-    const bills = [];
-    for (const exp of expenses.rows) {
-      const participants = await query(
-        `SELECT ep.user_id, ep.share_cents
-         FROM expense_participants ep
-         WHERE ep.expense_id = $1 AND ep.is_deleted = FALSE`,
-        [exp.id]
-      );
-      bills.push({
+    const participantRows = await query(
+      `SELECT ep.expense_id, ep.user_id, ep.share_cents
+       FROM expense_participants ep
+       JOIN expenses e ON e.id = ep.expense_id
+       WHERE e.room_id = $1 AND ep.is_deleted = FALSE AND e.is_deleted = FALSE
+       ORDER BY ep.user_id ASC`,
+      [id]
+    );
+    const byExpense = new Map();
+    for (const p of participantRows.rows) {
+      if (!byExpense.has(p.expense_id)) byExpense.set(p.expense_id, []);
+      byExpense.get(p.expense_id).push(p);
+    }
+    const bills = expenses.rows.map((exp) => {
+      const parts = byExpense.get(exp.id) || [];
+      return {
         id: exp.id,
         ledgerId: exp.room_id,
         payerId: exp.paid_by,
         payerName: exp.payer_name,
         payerColor: exp.payer_color,
-        amount: Math.round(exp.amount_cents) / 100,
-        timestamp: exp.created_at,
-        splitAmongIds: participants.rows.map(p => p.user_id),
-        shares: participants.rows.map(p => ({ userId: p.user_id, amount: Math.round(p.share_cents) / 100 })),
-        description: exp.description || '',
+        // integer paise is canonical on the wire
+        amount_paise: Number(exp.amount_cents),
+        // rupee float kept only as a legacy display convenience
+        amount: Number(exp.amount_cents) / 100,
+        timestamp: Number(exp.created_at),
         splitType: exp.split_type || 'EQUAL',
-      });
-    }
+        split_type: exp.split_type || 'EQUAL',
+        payerParticipates: exp.payer_participates !== false,
+        payer_participates: exp.payer_participates !== false,
+        description: exp.description || '',
+        splitAmongIds: parts.map((p) => p.user_id),
+        split_among: parts.map((p) => p.user_id),
+        // resolved integer shares — canonical; clients must not re-derive
+        shares_paise: parts.map((p) => ({ user_id: p.user_id, share_paise: Number(p.share_cents) })),
+        // legacy rupee shares for old renderers
+        shares: parts.map((p) => ({ userId: p.user_id, amount: Number(p.share_cents) / 100 })),
+      };
+    });
     res.json({ bills });
   } catch (err) {
     console.error("[rooms/expenses]", err.message);
@@ -319,12 +339,47 @@ router.get("/rooms/:id/expenses", async (req, res) => {
 });
 
 // ── POST an expense to a room ─────────────────────────────────────────
+// Integer paise in. All division is delegated to the shared allocate() —
+// this file contains no splitting math of its own. Rejections from allocate()
+// answer 422 { error, code, message } and write NOTHING (transactional).
+// Legacy `amount` (rupee float) is back-accepted for one release with a
+// Deprecation header so in-flight clients keep working.
 router.post("/rooms/:id/expenses", async (req, res) => {
   const { id } = req.params;
-  const { expense_id, paid_by, amount, split_among, description, split_type } = req.body ?? {};
-  if (!expense_id || !paid_by || !amount || !Array.isArray(split_among) || split_among.length === 0) {
-    return res.status(400).json({ error: "expense_id, paid_by, amount, split_among required" });
+  const {
+    expense_id, paid_by, amount, amount_paise,
+    split_among, participant_ids, shares,
+    description, split_type, payer_participates,
+  } = req.body ?? {};
+
+  if (!expense_id || !paid_by) {
+    return res.status(400).json({ error: "expense_id and paid_by required" });
   }
+
+  // ── amount resolution: amount_paise (canonical) or legacy amount rupees ──
+  let amountPaise;
+  let deprecated = false;
+  if (amount_paise !== undefined && amount_paise !== null) {
+    amountPaise = Number(amount_paise);
+    if (!Number.isSafeInteger(amountPaise) || amountPaise < 0) {
+      return res.status(422).json({ error: "INVALID_AMOUNT", code: "INVALID_AMOUNT", message: "amount_paise must be a non-negative safe integer" });
+    }
+  } else if (amount !== undefined && amount !== null) {
+    amountPaise = toPaise(amount); // handles numbers AND "1250.50" strings
+    deprecated = true;
+    if (!Number.isSafeInteger(amountPaise) || amountPaise < 0) {
+      return res.status(422).json({ error: "INVALID_AMOUNT", code: "INVALID_AMOUNT", message: "amount must be a positive rupee number with at most 2 decimals" });
+    }
+  } else {
+    return res.status(400).json({ error: "amount_paise (or legacy amount) required" });
+  }
+
+  // ── participants: participant_ids (canonical) or legacy split_among ────
+  const participants = participant_ids ?? split_among;
+  if (!Array.isArray(participants) || participants.length === 0) {
+    return res.status(400).json({ error: "participant_ids (or split_among) required" });
+  }
+
   try {
     const roomCheck = await query(
       "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
@@ -335,35 +390,71 @@ router.post("/rooms/:id/expenses", async (req, res) => {
     }
     const now = Date.now();
     const dbExpenseId = isUUID(expense_id) ? expense_id : crypto.randomUUID();
-    const amountCents = Math.round(Number(amount) * 100);
-    const share = Math.floor(amountCents / split_among.length);
-    const remainder = amountCents % split_among.length;
+    const type = typeof split_type === "string" ? split_type.toUpperCase() : "EQUAL";
+    // payer_participates: explicit toggle, defaults TRUE (historic behaviour).
+    // When FALSE the payer fronted the money but is not part of the split —
+    // allocate() never sees them; the full amount divides among participants.
+    const payerIn = payer_participates !== false;
 
-    await query(
-      `INSERT INTO expenses (id, room_id, paid_by, amount_cents, description, split_type, created_at, updated_at, is_deleted)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $7, FALSE)
-       ON CONFLICT (id) DO UPDATE SET
-         amount_cents = EXCLUDED.amount_cents,
-         updated_at = EXCLUDED.updated_at`,
-      [dbExpenseId, id, paid_by, amountCents, description || '', split_type || 'EQUAL', now]
-    );
-
-    // Insert participants
-    const sorted = [...split_among].sort();
-    for (let i = 0; i < sorted.length; i++) {
-      const shareAmount = share + (i < remainder ? 1 : 0);
-      await query(
-        `INSERT INTO expense_participants (expense_id, user_id, share_cents, updated_at, is_deleted)
-         VALUES ($1, $2, $3, $4, FALSE)
-         ON CONFLICT (expense_id, user_id) DO UPDATE SET
-           share_cents = EXCLUDED.share_cents,
-           updated_at = EXCLUDED.updated_at`,
-        [dbExpenseId, sorted[i], shareAmount, now]
-      );
+    // ── THE split decision: one call, one implementation ──
+    const allocation = allocate({
+      amountPaise,
+      userIds: participants,
+      type,
+      shares: Array.isArray(shares)
+        ? shares.map((s) => ({
+            user_id: s.user_id,
+            amount_paise: Number(s.amount_paise),
+            percent: s.percent !== undefined ? Number(s.percent) : undefined,
+            weight: s.weight !== undefined ? Number(s.weight) : undefined,
+          }))
+        : undefined,
+    });
+    if (!allocation.ok) {
+      return res.status(422).json({
+        error: allocation.code,
+        code: allocation.code,
+        message: allocation.message,
+      });
     }
 
-    console.log(`[rooms/expenses] Expense ${dbExpenseId} added to room ${id} by ${paid_by} — ₹${amount}`);
-    res.json({ ok: true, expense_id: dbExpenseId, client_id: expense_id });
+    // Transaction: a rejected/failed write must leave no partial rows.
+    await withTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO expenses (id, room_id, paid_by, amount_cents, description, split_type, payer_participates, created_at, updated_at, is_deleted)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, FALSE)
+         ON CONFLICT (id) DO UPDATE SET
+           amount_cents = EXCLUDED.amount_cents,
+           description = EXCLUDED.description,
+           split_type = EXCLUDED.split_type,
+           payer_participates = EXCLUDED.payer_participates,
+           updated_at = EXCLUDED.updated_at`,
+        [dbExpenseId, id, paid_by, amountPaise, description || '', type, payerIn, now]
+      );
+
+      // Replace participants with the allocated shares.
+      await client.query(
+        `UPDATE expense_participants SET is_deleted = TRUE, updated_at = $2
+         WHERE expense_id = $1 AND is_deleted = FALSE`,
+        [dbExpenseId, now]
+      );
+      for (const s of allocation.shares) {
+        await client.query(
+          `INSERT INTO expense_participants (expense_id, user_id, share_cents, updated_at, is_deleted)
+           VALUES ($1, $2, $3, $4, FALSE)
+           ON CONFLICT (expense_id, user_id) DO UPDATE SET
+             share_cents = EXCLUDED.share_cents,
+             updated_at = EXCLUDED.updated_at,
+             is_deleted = FALSE`,
+          [dbExpenseId, s.user_id, s.share_paise, now]
+        );
+      }
+    });
+
+    if (deprecated) res.setHeader("Deprecation", "true");
+    if (deprecated) res.setHeader("Sunset", "Sat, 31 Oct 2026 00:00:00 GMT");
+    console.log(`[rooms/expenses] Expense ${dbExpenseId} added to room ${id} by ${paid_by} — ${(amountPaise / 100).toFixed(2)} (${type}${payerIn ? "" : ", payer excluded"})`);
+    res.json({ ok: true, expense_id: dbExpenseId, client_id: expense_id, split_type: type, shares: allocation.shares });
   } catch (err) {
     console.error("[rooms/expenses/create]", err.message);
     res.status(500).json({ error: "internal" });
@@ -421,7 +512,10 @@ router.delete("/rooms/:id", async (req, res) => {
   }
 });
 
-// ── GET balances for a room (net amounts per member) ──────────────────
+// ── GET balances for a room — THE server-authoritative derivation ─────
+// Integer paise end to end. One query; nets always sum to exactly 0.
+// Note: `nets` (legacy alias `balances`, rupees) is still returned so the
+// pre-existing delete-warning client keeps working.
 router.get("/rooms/:id/balances", async (req, res) => {
   const { id } = req.params;
   try {
@@ -432,28 +526,176 @@ router.get("/rooms/:id/balances", async (req, res) => {
     if (!roomCheck.rows.length) {
       return res.status(404).json({ error: "room_not_found" });
     }
-    const expenses = await query(
-      `SELECT e.paid_by, e.amount_cents, ep.user_id, ep.share_cents
+
+    // ONE balance-derivation query: payer credited the full amount,
+    // each participant debited their resolved share.
+    const ledgerRows = await query(
+      `
+      -- expense legs (positive = the room paid this member)
+      SELECT e.paid_by AS user_id, e.amount_cents::bigint AS paise, 'expense' AS leg
+      FROM expenses e
+      WHERE e.room_id = $1 AND e.is_deleted = FALSE
+      UNION ALL
+      SELECT ep.user_id, -ep.share_cents::bigint AS paise, 'share' AS leg
+      FROM expenses e
+      JOIN expense_participants ep ON ep.expense_id = e.id
+      WHERE e.room_id = $1 AND e.is_deleted = FALSE AND ep.is_deleted = FALSE
+      UNION ALL
+      -- settlement legs: PENDING and COMPLETED reduce the outstanding balance;
+      -- VOID is excluded from all balance maths.
+      SELECT s.from_user, s.amount_cents::bigint AS paise, 'settle' AS leg
+      FROM settlements s
+      WHERE s.room_id = $1 AND s.is_deleted = FALSE AND s.status IN ('PENDING','COMPLETED')
+      UNION ALL
+      SELECT s.to_user, -s.amount_cents::bigint AS paise, 'settle' AS leg
+      FROM settlements s
+      WHERE s.room_id = $1 AND s.is_deleted = FALSE AND s.status IN ('PENDING','COMPLETED')
+      `,
+      [id]
+    );
+
+    const settlementsRows = await query(
+      `SELECT s.from_user, s.to_user, s.amount_cents, s.status
+       FROM settlements s
+       WHERE s.room_id = $1 AND s.is_deleted = FALSE AND s.status IN ('PENDING','COMPLETED')`,
+      [id]
+    );
+
+    // ── nets (integer paise, + = owed money) ──
+    const nets = {};
+    for (const r of ledgerRows.rows) {
+      nets[r.user_id] = (nets[r.user_id] || 0) + Number(r.paise);
+    }
+
+    // ── pairwise: owed[a→b] = Σ share of a in expenses paid by b
+    //            settled[a→b] = Σ settlements a paid to b (PENDING+COMPLETED)
+    //            outstanding = owed - settled (0 when b "owes" a instead)
+    const owedPair = {};   // key "a|b": a owes b
+    const settledPair = {};
+    const bump = (map, a, b, v) => {
+      const k = `${a}|${b}`;
+      map[k] = (map[k] || 0) + v;
+    };
+
+    const expenseRows = await query(
+      `SELECT e.paid_by, ep.user_id, ep.share_cents
        FROM expenses e
        JOIN expense_participants ep ON ep.expense_id = e.id
        WHERE e.room_id = $1 AND e.is_deleted = FALSE AND ep.is_deleted = FALSE`,
       [id]
     );
-    const balances = {};
-    for (const row of expenses.rows) {
-      // payer gets credited the full amount
-      if (!balances[row.paid_by]) balances[row.paid_by] = 0;
-      balances[row.paid_by] += row.amount_cents;
-      // each participant owes their share
-      if (!balances[row.user_id]) balances[row.user_id] = 0;
-      balances[row.user_id] -= row.share_cents;
+    for (const r of expenseRows.rows) {
+      if (r.paid_by === r.user_id) continue; // payer's own share — not a pair debt
+      bump(owedPair, r.user_id, r.paid_by, Number(r.share_cents));
     }
-    // Convert to rupees
-    const result = {};
-    for (const [userId, cents] of Object.entries(balances)) {
-      result[userId] = Math.round(cents) / 100;
+    for (const s of settlementsRows.rows) {
+      bump(settledPair, s.from_user, s.to_user, Number(s.amount_cents));
     }
-    res.json({ balances: result });
+
+    const membersInvolved = new Set();
+    for (const r of ledgerRows.rows) membersInvolved.add(r.user_id);
+    for (const k of Object.keys(owedPair)) for (const u of k.split("|")) membersInvolved.add(u);
+    for (const k of Object.keys(settledPair)) for (const u of k.split("|")) membersInvolved.add(u);
+    const memberList = [...membersInvolved].sort();
+
+    const pairwise = [];
+    for (let i = 0; i < memberList.length; i++) {
+      for (let j = i + 1; j < memberList.length; j++) {
+        const a = memberList[i];
+        const b = memberList[j];
+        const ab = owedPair[`${a}|${b}`] || 0; // a owes b (from b's expenses)
+        const ba = owedPair[`${b}|${a}`] || 0; // b owes a
+        const settledAB = settledPair[`${a}|${b}`] || 0;
+        const settledBA = settledPair[`${b}|${a}`] || 0;
+        // net direction after netting mutual debts and mutual settlements
+        const owedNet = ab - ba;
+        const settledNet = settledAB - settledBA;
+        const direction = owedNet - settledNet; // >0 → a owes b net
+        pairwise.push({
+          a,
+          b,
+          owed_a_to_b_paise: Math.max(direction, 0),
+          owed_b_to_a_paise: Math.max(-direction, 0),
+          settled_ab_paise: settledNet >= 0 ? settledNet : 0,
+          outstanding_a_to_b_paise: Math.max(direction, 0),
+        });
+      }
+    }
+
+    // ── pending settlements per member → partially_settled flag ──
+    const pendingRows = await query(
+      `SELECT from_user, to_user FROM settlements
+       WHERE room_id = $1 AND is_deleted = FALSE AND status = 'PENDING'`,
+      [id]
+    );
+    const pendingMembers = new Set();
+    for (const s of pendingRows.rows) {
+      pendingMembers.add(s.from_user);
+      pendingMembers.add(s.to_user);
+    }
+
+    // ── statuses + flags per member ──
+    const statuses = {};
+    const flags = {};
+    for (const [userId, net] of Object.entries(nets)) {
+      statuses[userId] = net < 0 ? "owes" : net > 0 ? "owed" : "settled";
+      flags[userId] = { partially_settled: net !== 0 && pendingMembers.has(userId) };
+    }
+
+    // ── suggestions: deterministic greedy simplification (same rule as client) ──
+    const debtors = [];
+    const creditors = [];
+    for (const [userId, net] of Object.entries(nets)) {
+      if (net < 0) debtors.push({ id: userId, amount: -net });
+      else if (net > 0) creditors.push({ id: userId, amount: net });
+    }
+    debtors.sort((x, y) => y.amount - x.amount || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+    creditors.sort((x, y) => y.amount - x.amount || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+    const suggestions = [];
+    let di = 0, ci = 0;
+    while (di < debtors.length && ci < creditors.length) {
+      const pay = Math.min(debtors[di].amount, creditors[ci].amount);
+      if (pay > 0) suggestions.push({ from: debtors[di].id, to: creditors[ci].id, amount_paise: pay });
+      debtors[di].amount -= pay;
+      creditors[ci].amount -= pay;
+      if (debtors[di].amount === 0) di++;
+      if (creditors[ci].amount === 0) ci++;
+    }
+
+    // ── summary ──
+    const totalRow = await query(
+      `SELECT COALESCE(SUM(amount_cents), 0)::bigint AS total, COUNT(*)::int AS n
+       FROM expenses WHERE room_id = $1 AND is_deleted = FALSE`,
+      [id]
+    );
+    const summary = {
+      total_paise: Number(totalRow.rows[0]?.total ?? 0),
+      expense_count: Number(totalRow.rows[0]?.n ?? 0),
+      settled_count: 0,
+      pending_count: pendingRows.rows.length,
+    };
+    const completedCount = await query(
+      `SELECT COUNT(*)::int AS n FROM settlements
+       WHERE room_id = $1 AND is_deleted = FALSE AND status = 'COMPLETED'`,
+      [id]
+    );
+    summary.settled_count = Number(completedCount.rows[0]?.n ?? 0);
+
+    // Legacy alias: rupee floats for the old delete-warning client.
+    const legacyBalances = {};
+    for (const [userId, paise] of Object.entries(nets)) {
+      legacyBalances[userId] = paise / 100;
+    }
+
+    res.json({
+      summary,
+      nets,
+      statuses,
+      flags,
+      pairwise,
+      suggestions,
+      balances: legacyBalances, // legacy: rupee floats, do not compute from
+    });
   } catch (err) {
     console.error("[rooms/balances]", err.message);
     res.status(500).json({ error: "internal" });
@@ -486,7 +728,7 @@ router.delete("/rooms/:id/expenses", async (req, res) => {
 
 // ── Settlements (recorded debt payments between members) ────────────────
 
-// GET all settlements for a room
+// GET all settlements for a room (with lifecycle fields)
 router.get("/rooms/:id/settlements", async (req, res) => {
   const { id } = req.params;
   try {
@@ -498,7 +740,7 @@ router.get("/rooms/:id/settlements", async (req, res) => {
       return res.status(404).json({ error: "room_not_found" });
     }
     const rows = await query(
-      `SELECT id, room_id, from_user, to_user, amount_cents, created_at
+      `SELECT id, room_id, from_user, to_user, amount_cents, status, method, note, settled_at, created_by, created_at
        FROM settlements
        WHERE room_id = $1 AND is_deleted = FALSE
        ORDER BY created_at ASC`,
@@ -509,7 +751,15 @@ router.get("/rooms/:id/settlements", async (req, res) => {
         id: r.id,
         fromUserId: r.from_user,
         toUserId: r.to_user,
-        amount: Math.round(r.amount_cents) / 100,
+        // integer paise is canonical
+        amount_paise: Number(r.amount_cents),
+        // legacy rupee amount for old renderers
+        amount: Number(r.amount_cents) / 100,
+        status: r.status || 'COMPLETED',
+        method: r.method || 'OTHER',
+        note: r.note || '',
+        settledAt: r.settled_at ? Number(r.settled_at) : null,
+        createdBy: r.created_by || null,
         timestamp: Number(r.created_at),
       })),
     });
@@ -519,14 +769,41 @@ router.get("/rooms/:id/settlements", async (req, res) => {
   }
 });
 
-// POST a settlement — from_user paid to_user the given amount
+// POST a settlement — from_user paid to_user the given amount.
+// status PENDING = payment initiated, still counts against the balance;
+// COMPLETED (default) = confirmed, clears the debt.
 router.post("/rooms/:id/settlements", async (req, res) => {
   const { id } = req.params;
-  const { settlement_id, from_user, to_user, amount } = req.body ?? {};
-  const amountNum = Number(amount);
-  if (!from_user || !to_user || !Number.isFinite(amountNum) || amountNum <= 0) {
-    return res.status(400).json({ error: "from_user, to_user and positive amount required" });
+  const {
+    settlement_id, from_user, to_user, amount, amount_paise,
+    status, method, note, created_by,
+  } = req.body ?? {};
+
+  let amountPaise;
+  let deprecated = false;
+  if (amount_paise !== undefined && amount_paise !== null) {
+    amountPaise = Number(amount_paise);
+  } else if (amount !== undefined && amount !== null) {
+    amountPaise = toPaise(amount);
+    deprecated = true;
+  } else {
+    amountPaise = NaN;
   }
+  if (!from_user || !to_user || !Number.isSafeInteger(amountPaise) || amountPaise <= 0) {
+    return res.status(400).json({ error: "from_user, to_user and positive amount_paise required" });
+  }
+
+  const VALID_STATUS = new Set(["PENDING", "COMPLETED"]);
+  const VALID_METHOD = new Set(["UPI", "CASH", "OTHER"]);
+  const st = typeof status === "string" ? status.toUpperCase() : "COMPLETED";
+  const me = typeof method === "string" ? method.toUpperCase() : "OTHER";
+  if (!VALID_STATUS.has(st)) {
+    return res.status(422).json({ error: "INVALID_STATUS", code: "INVALID_STATUS", message: "status must be PENDING or COMPLETED on create" });
+  }
+  if (!VALID_METHOD.has(me)) {
+    return res.status(422).json({ error: "INVALID_METHOD", code: "INVALID_METHOD", message: "method must be UPI, CASH or OTHER" });
+  }
+
   try {
     const room = await query(
       "SELECT id FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
@@ -538,17 +815,87 @@ router.post("/rooms/:id/settlements", async (req, res) => {
     const now = Date.now();
     const dbId = isUUID(settlement_id) ? settlement_id : randomUUID();
     await query(
-      `INSERT INTO settlements (id, room_id, from_user, to_user, amount_cents, created_at, updated_at, is_deleted)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE)
+      `INSERT INTO settlements (id, room_id, from_user, to_user, amount_cents, status, method, note, settled_at, created_by, created_at, updated_at, is_deleted)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,FALSE)
        ON CONFLICT (id) DO UPDATE SET
          amount_cents = EXCLUDED.amount_cents,
+         status = EXCLUDED.status,
+         method = EXCLUDED.method,
+         note = EXCLUDED.note,
+         settled_at = EXCLUDED.settled_at,
          updated_at = EXCLUDED.updated_at`,
-      [dbId, id, from_user, to_user, Math.round(amountNum * 100), now, now]
+      [dbId, id, from_user, to_user, amountPaise, st, me, note || "", st === "COMPLETED" ? now : null, created_by || null, now]
     );
-    console.log(`[rooms/settlements] ${from_user} paid ${to_user} ₹${amountNum} in room ${id}`);
-    res.json({ ok: true, settlement_id: dbId });
+    if (deprecated) res.setHeader("Deprecation", "true");
+    console.log(`[rooms/settlements] ${from_user} paid ${to_user} ${(amountPaise / 100).toFixed(2)} in room ${id} [${st}/${me}]`);
+    res.json({ ok: true, settlement_id: dbId, status: st, method: me });
   } catch (err) {
     console.error("[rooms/settlements/create]", err.message);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// PATCH a settlement lifecycle transition: PENDING → COMPLETED | VOID.
+// COMPLETED marks it confirmed; VOID excludes it from all balance maths.
+router.patch("/rooms/:id/settlements/:sid", async (req, res) => {
+  const { id, sid } = req.params;
+  const { status } = req.body ?? {};
+  const st = typeof status === "string" ? status.toUpperCase() : "";
+  if (!["COMPLETED", "VOID", "PENDING"].includes(st)) {
+    return res.status(422).json({ error: "INVALID_STATUS", code: "INVALID_STATUS", message: "status must be COMPLETED, VOID or PENDING" });
+  }
+  try {
+    const room = await query(
+      "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!room.rows.length) return res.status(404).json({ error: "room_not_found" });
+
+    const existing = await query(
+      "SELECT id, status FROM settlements WHERE id = $1 AND room_id = $2 AND is_deleted = FALSE LIMIT 1",
+      [sid, id]
+    );
+    if (!existing.rows.length) return res.status(404).json({ error: "settlement_not_found" });
+
+    const now = Date.now();
+    const updated = await query(
+      `UPDATE settlements
+       SET status = $3,
+           settled_at = CASE WHEN $3 = 'COMPLETED' THEN COALESCE(settled_at, $4) ELSE settled_at END,
+           updated_at = $4
+       WHERE id = $1 AND room_id = $2
+       RETURNING id, status`,
+      [sid, id, st, now]
+    );
+    console.log(`[rooms/settlements] ${sid} → ${st} in room ${id}`);
+    res.json({ ok: true, settlement_id: updated.rows[0].id, status: updated.rows[0].status });
+  } catch (err) {
+    console.error("[rooms/settlements/patch]", err.message);
+    res.status(500).json({ error: "internal" });
+  }
+});
+
+// DELETE (soft-void) a single settlement — audit trail retained, excluded
+// from all balance maths. The bulk DELETE /rooms/:id/settlements (reset) stays.
+router.delete("/rooms/:id/settlements/:sid", async (req, res) => {
+  const { id, sid } = req.params;
+  try {
+    const room = await query(
+      "SELECT 1 FROM rooms WHERE id = $1 AND is_deleted = FALSE LIMIT 1",
+      [id]
+    );
+    if (!room.rows.length) return res.status(404).json({ error: "room_not_found" });
+    const updated = await query(
+      `UPDATE settlements SET status = 'VOID', updated_at = $3
+       WHERE id = $1 AND room_id = $2 AND is_deleted = FALSE
+       RETURNING id`,
+      [sid, id, Date.now()]
+    );
+    if (!updated.rows.length) return res.status(404).json({ error: "settlement_not_found" });
+    console.log(`[rooms/settlements] ${sid} VOIDED in room ${id}`);
+    res.json({ ok: true, settlement_id: sid, status: "VOID" });
+  } catch (err) {
+    console.error("[rooms/settlements/delete-one]", err.message);
     res.status(500).json({ error: "internal" });
   }
 });

@@ -107,5 +107,13 @@ install.
   (`is_deleted = TRUE`), so TRUNCATE is the only way to truly empty the tables.
 - The wipe endpoint truncates in FK-safe order: `conflict_log → settlements →
   expense_participants → expenses → room_members → rooms → users`.
+  (The table list is unchanged by the split/settlement upgrade — no new tables,
+  only new columns.)
 - After wiping, old invite codes are dead: joining by a previous code returns
   `room_not_found`.
+- On every boot the backend re-applies `db/schema.sql` **and** every
+  `migrations/*.sql` in filename order (all idempotent), so a wiped-or-fresh
+  database always comes up with the full split/settlement schema —
+  `expenses.payer_participates`, the `split_type` check, and the settlements
+  lifecycle columns (`status`, `method`, `note`, `settled_at`, `created_by`).
+  No manual SQL is needed after a wipe.

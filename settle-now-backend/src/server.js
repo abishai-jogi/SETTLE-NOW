@@ -21,16 +21,32 @@ const { default: app } = await import("./app.js");
 
 // Auto-create tables on first boot so a fresh cloud database (Railway/Render/Neon)
 // works with zero manual SQL. Safe to run every start: everything is IF NOT EXISTS.
+// After the base schema, every migrations/*.sql is applied in filename order —
+// they are written idempotent (ADD COLUMN IF NOT EXISTS / guarded constraints),
+// so existing deployed databases upgrade in place on boot.
 async function ensureSchema() {
+    const { query } = await import("./db.js");
     const schemaPath = path.join(here, "..", "db", "schema.sql");
     const sql = fs.readFileSync(schemaPath, "utf8");
-    const { query } = await import("./db.js");
     await query(sql);
+    const migrationsDir = path.join(here, "..", "migrations");
+    if (fs.existsSync(migrationsDir)) {
+        const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
+        for (const f of files) {
+            const mig = fs.readFileSync(path.join(migrationsDir, f), "utf8");
+            await query(mig);
+            console.log(`[schema] migration applied: ${f}`);
+        }
+    }
     console.log("[schema] verified/created all tables");
 }
 
-// Number("") is 0, so fall back whenever PORT is unset, empty, or non-numeric
-const port = Number(process.env.PORT) > 0 ? Number(process.env.PORT) : 4000;
+// BACKEND_PORT wins (lets the API be co-hosted beside a Vite dev server that
+// owns the managed PORT), then PORT, then the historical default 4000.
+const port =
+  Number(process.env.BACKEND_PORT) > 0 ? Number(process.env.BACKEND_PORT)
+  : Number(process.env.PORT) > 0 ? Number(process.env.PORT)
+  : 4000;
 try {
     await ensureSchema();
 } catch (err) {

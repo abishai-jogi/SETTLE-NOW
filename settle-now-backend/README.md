@@ -1,6 +1,21 @@
-# Settle Now — Sync Backend (Phase 2/3)
+# Settle Now — Backend
 
-Node.js + Express + PostgreSQL. Stateless REST sync: clients drain their local outbox via push, then pull changes newer than their per-entity cursors.
+Node.js + Express + PostgreSQL. Single REST surface (`src/routes/rooms.js`):
+rooms, expenses (EQUAL/EXACT/PERCENT/SHARES via the shared `src/lib/splitEngine.js`,
+integer paise), server-authoritative balances (`nets`, `pairwise`, `suggestions`,
+`statuses`, `flags`), and settlements with a real lifecycle (PENDING/COMPLETED/VOID).
+
+The former cursor-based `/api/sync/push` + `/api/sync/pull` routes were removed —
+no client ever called them (verified: no fetch to either path existed in any
+frontend). The `conflict_log` table remains in the schema but is no longer
+written to; dropping it is a separate decision.
+
+## Money representation
+
+All API amounts are **integer paise** (`amount_paise`, `share_paise`,
+`net_paise` …). Legacy `amount` (rupee float) inputs are still accepted on
+`POST /rooms/:id/expenses` and `POST /rooms/:id/settlements` for one release
+and answered with a `Deprecation` header.
 
 ## Run
 
@@ -16,7 +31,68 @@ npm start                               # http://localhost:4000
 
 ## API
 
-### POST /api/sync/push
+### POST /api/rooms/:id/expenses
+
+```jsonc
+{
+  "expense_id": "uuid",          // client-generated; idempotent upsert
+  "paid_by": "uuid",
+  "amount_paise": 125000,        // ₹1250.00 in paise (integer)
+  "payer_participates": true,    // false → full amount divided among participants
+  "split_type": "EQUAL",         // EQUAL | EXACT | PERCENT | SHARES
+  "participant_ids": ["uuid"],   // used by EQUAL
+  "shares": [                    // used by EXACT / PERCENT / SHARES
+    { "user_id": "uuid", "amount_paise": 62500 },   // EXACT: must sum to amount_paise
+    { "user_id": "uuid", "percent": 40 },           // PERCENT: scaled to the amount
+    { "user_id": "uuid", "weight": 2 }              // SHARES: weight-based
+  ],
+  "description": "Hotel room"
+}
+```
+
+All division is delegated to the shared `allocate()` in `src/lib/splitEngine.js`.
+Rejections answer `422` with `{ error: code, code, message }` (e.g.
+`EXACT_SUM_MISMATCH`, `NO_PARTICIPANTS`, `ZERO_AMOUNT`) and write nothing.
+
+### GET /api/rooms/:id/balances
+
+The **only** source of truth for balances — the client never recomputes them.
+
+```jsonc
+{
+  "summary": { "total_paise": 0, "expense_count": 0, "settled_count": 0, "pending_count": 0 },
+  "nets":     { "<userId>": 0 },        // integer paise, + = owed money; Σ nets == 0 always
+  "statuses": { "<userId>": "settled" }, // owes | owed | settled
+  "flags":    { "<userId>": { "partially_settled": false } },
+  "pairwise": [ { "a": "…", "b": "…", "owed_a_to_b_paise": 0, "settled_ab_paise": 0, "outstanding_a_to_b_paise": 0 } ],
+  "suggestions": [ { "from": "…", "to": "…", "amount_paise": 0 } ]
+}
+```
+
+### POST /api/rooms/:id/settlements
+
+```jsonc
+{
+  "settlement_id": "uuid",
+  "from_user": "uuid", "to_user": "uuid",
+  "amount_paise": 50000,
+  "status": "PENDING",           // default COMPLETED
+  "method": "UPI",               // UPI | CASH | OTHER (default OTHER)
+  "note": "for the taxi"
+}
+```
+
+Lifecycle: `PATCH /api/rooms/:id/settlements/:sid` with `{ "status": "COMPLETED" | "VOID" }`
+transitions a PENDING settlement; `DELETE /api/rooms/:id/settlements/:sid` voids one
+(soft). The bulk `DELETE /api/rooms/:id/settlements` (reset action) is unchanged.
+
+Legacy docs from the removed sync surface are retained below for reference.
+
+---
+
+### POST /api/sync/push (REMOVED)
+
+The cursor-based sync surface was deleted; see the header note above.
 
 ```jsonc
 {

@@ -41,9 +41,12 @@ CREATE TABLE IF NOT EXISTS expenses (
     amount_cents BIGINT NOT NULL CHECK (amount_cents >= 0),
     description TEXT NOT NULL DEFAULT '',
     split_type  TEXT NOT NULL DEFAULT 'EQUAL',
+    payer_participates BOOLEAN NOT NULL DEFAULT TRUE,
     created_at  BIGINT NOT NULL,
     updated_at  BIGINT NOT NULL,
-    is_deleted  BOOLEAN NOT NULL DEFAULT FALSE
+    is_deleted  BOOLEAN NOT NULL DEFAULT FALSE,
+    CONSTRAINT expenses_split_type_chk
+      CHECK (split_type IN ('EQUAL','EXACT','PERCENT','SHARES'))
 );
 CREATE INDEX IF NOT EXISTS idx_expenses_room ON expenses (room_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_expenses_updated_at ON expenses (updated_at);
@@ -65,9 +68,18 @@ CREATE TABLE IF NOT EXISTS settlements (
     from_user    UUID NOT NULL REFERENCES users(id),
     to_user      UUID NOT NULL REFERENCES users(id),
     amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
+    status       TEXT NOT NULL DEFAULT 'COMPLETED',
+    method       TEXT NOT NULL DEFAULT 'OTHER',
+    note         TEXT NOT NULL DEFAULT '',
+    settled_at   BIGINT,
+    created_by   UUID REFERENCES users(id),
     created_at   BIGINT NOT NULL,
     updated_at   BIGINT NOT NULL,
-    is_deleted   BOOLEAN NOT NULL DEFAULT FALSE
+    is_deleted   BOOLEAN NOT NULL DEFAULT FALSE,
+    CONSTRAINT settlements_status_chk
+      CHECK (status IN ('PENDING','COMPLETED','VOID')),
+    CONSTRAINT settlements_method_chk
+      CHECK (method IN ('UPI','CASH','OTHER'))
 );
 CREATE INDEX IF NOT EXISTS idx_settlements_room ON settlements (room_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_settlements_updated_at ON settlements (updated_at);
