@@ -24,6 +24,7 @@ import {
   isLocalAccount,
 } from "./lib/storage.js";
 import { genUuid } from "./lib/uid.js";
+import { toPaise } from "./lib/money.js";
 import AuthScreen from "./components/AuthScreen.jsx";
 import LedgerSelection from "./components/LedgerSelection.jsx";
 import ChatScreen from "./components/ChatScreen.jsx";
@@ -117,6 +118,10 @@ export default function App() {
           // Ensure timestamps are numbers (server may return strings from PostgreSQL BIGINT)
           if (typeof b.timestamp === 'string') b.timestamp = Number(b.timestamp);
           if (typeof b.amount === 'string') b.amount = Number(b.amount);
+          // Canonical integer-paise amount from the server
+          if (typeof b.amount_paise !== 'number') {
+            b.amount_paise = toPaise(b.amount ?? 0);
+          }
           local.push(b);
           changed = true;
         }

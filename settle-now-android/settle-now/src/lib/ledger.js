@@ -1,51 +1,108 @@
-const round2 = (n) => Math.round(n * 100) / 100;
+import { toPaise } from "./money.js";
+import { allocate } from "./splitEngine.js";
 
 /**
- * Net balance per member. Positive = owed money.
- * Expenses create debt; recorded settlements reduce it — a settlement of X
- * from A to B is exactly A paying X toward what they owe B.
- * settlements: [{ fromUserId, toUserId, amount }]
+ * Ledger math — integer paise everywhere.
+ *
+ * All functions keep their historical signatures (rupee amounts in/out) so
+ * StatsDrawer.jsx and MonthlyHistory.jsx keep working unchanged; internally
+ * every calculation runs on integer paise via the shared splitEngine, so no
+ * float arithmetic ever participates in a balance.
+ *
+ * Bills may arrive in either shape:
+ *   - legacy: { amount } rupee float, always EQUAL across splitAmongIds
+ *   - new:    { amount_paise, splitType, shares_paise[], payerParticipates }
+ * Both are normalized here — the rest of the app never sees the difference.
  */
-export function netBalances(bills, members, settlements = []) {
-  const bal = Object.fromEntries(members.map((m) => [m.id, 0]));
-  for (const b of bills) {
-    for (const id of b.splitAmongIds) if (!(id in bal)) bal[id] = 0;
+
+/** Normalize any bill shape → integer-paise bill with resolved shares. */
+export function normalizeBill(b) {
+  const amount_paise =
+    typeof b.amount_paise === "number"
+      ? b.amount_paise
+      : toPaise(b.amount ?? 0);
+  if (!Number.isSafeInteger(amount_paise) || amount_paise < 0) return null;
+  const splitType = b.splitType || b.split_type || "EQUAL";
+  const payerParticipates = b.payerParticipates ?? b.payer_participates ?? true;
+  let participants = Array.isArray(b.splitAmongIds)
+    ? b.splitAmongIds
+    : Array.isArray(b.split_among)
+      ? b.split_among
+      : [];
+  // Resolved shares: from the server when present, else derive locally
+  // through the same engine the server uses.
+  let shares;
+  if (Array.isArray(b.shares_paise) && b.shares_paise.length > 0) {
+    shares = b.shares_paise.map((s) => ({ user_id: s.user_id, share_paise: s.share_paise }));
+  } else if (Array.isArray(b.shares) && b.shares.length > 0 && splitType !== "EQUAL") {
+    shares = b.shares.map((s) => ({ user_id: s.userId ?? s.user_id, share_paise: toPaise(s.amount ?? 0) }));
+  } else {
+    const r = allocate({ amountPaise: amount_paise, userIds: participants, type: splitType });
+    if (!r.ok) return null;
+    shares = r.shares;
   }
-  for (const b of bills) {
-    const n = b.splitAmongIds.length;
-    if (n === 0) continue;
-    const share = b.amount / n;
-    for (const id of b.splitAmongIds) bal[id] -= share;
-    if (b.payerId in bal) bal[b.payerId] += b.amount;
-  }
-  for (const s of settlements) {
-    if (!(s.fromUserId in bal)) bal[s.fromUserId] = 0;
-    if (!(s.toUserId in bal)) bal[s.toUserId] = 0;
-    bal[s.fromUserId] += s.amount; // payer's debt decreases
-    bal[s.toUserId] -= s.amount;   // receiver is owed less
-  }
-  return Object.fromEntries(Object.entries(bal).map(([id, v]) => [id, round2(v)]));
+  return {
+    ...b,
+    amount_paise,
+    splitType,
+    payerParticipates,
+    splitAmongIds: shares.map((s) => s.user_id),
+    shares_paise: shares,
+  };
 }
 
-export function paidTotals(bills, members) {
-  const t = Object.fromEntries(members.map((m) => [m.id, 0]));
-  for (const b of bills) {
-    if (b.payerId in t) t[b.payerId] += b.amount;
+/**
+ * Net balance per member in RUPEES (public signature preserved) — computed
+ * entirely in integer paise. Positive = owed money.
+ * PENDING and COMPLETED settlements reduce the balance; VOID does not.
+ */
+export function netBalances(bills, members, settlements = []) {
+  const bal = {};
+  for (const m of members) if (!(m.id in bal)) bal[m.id] = 0;
+  for (const raw of bills) {
+    const b = normalizeBill(raw);
+    if (!b) continue;
+    for (const s of b.shares_paise) {
+      if (!(s.user_id in bal)) bal[s.user_id] = 0;
+      bal[s.user_id] -= s.share_paise;
+    }
+    if (b.payerId in bal) bal[b.payerId] += b.amount_paise;
   }
-  return Object.fromEntries(Object.entries(t).map(([id, v]) => [id, round2(v)]));
+  for (const s of settlements) {
+    if (s.status === "VOID") continue;
+    const paise = typeof s.amount_paise === "number" ? s.amount_paise : toPaise(s.amount ?? 0);
+    if (!(s.fromUserId in bal)) bal[s.fromUserId] = 0;
+    if (!(s.toUserId in bal)) bal[s.toUserId] = 0;
+    bal[s.fromUserId] += paise; // payer's debt decreases
+    bal[s.toUserId] -= paise;   // receiver is owed less
+  }
+  // Paise → rupees only at the return boundary (display formatting).
+  return Object.fromEntries(Object.entries(bal).map(([id, p]) => [id, p / 100]));
+}
+
+/** Total paid per member (rupees out, paise in). */
+export function paidTotals(bills, members) {
+  const t = {};
+  for (const m of members) t[m.id] = 0;
+  for (const raw of bills) {
+    const b = normalizeBill(raw);
+    if (b && b.payerId in t) t[b.payerId] += b.amount_paise;
+  }
+  return Object.fromEntries(Object.entries(t).map(([id, p]) => [id, p / 100]));
 }
 
 export function sumSince(bills, id, days) {
   const cut = Date.now() - days * 86400000;
   let s = 0;
-  for (const b of bills) {
-    if (b.payerId === id && b.timestamp >= cut) s += b.amount;
+  for (const raw of bills) {
+    const b = normalizeBill(raw);
+    if (b && b.payerId === id && b.timestamp >= cut) s += b.amount_paise;
   }
-  return round2(s);
+  return s / 100;
 }
 
 export const groupTotal = (bills) =>
-  round2(bills.reduce((a, b) => a + b.amount, 0));
+  bills.reduce((a, raw) => a + (normalizeBill(raw)?.amount_paise ?? 0), 0) / 100;
 
 /**
  * Whole calendar months from month a to month b (b - a).
@@ -64,71 +121,76 @@ function monthIndexDistance(a, b) {
  * Only completed months that actually have expenses are included.
  */
 export function monthlyHistory(bills, now = new Date()) {
-  // Bucket by (year, month)
   const buckets = new Map();
-  for (const b of bills) {
+  for (const raw of bills) {
+    const b = normalizeBill(raw);
+    if (!b) continue;
     const d = new Date(b.timestamp);
     const key = `${d.getFullYear()}|${d.getMonth()}`;
-    buckets.set(key, (buckets.get(key) || 0) + b.amount);
+    buckets.set(key, (buckets.get(key) || 0) + b.amount_paise);
   }
 
   // Keep completed months only, oldest first, so the oldest is "1" and
   // numbering increases upward (calendar-distance based, gap-safe).
   const rawEntries = [];
-  for (const [key, sum] of buckets) {
+  for (const [key, sumPaise] of buckets) {
     const [year, month] = key.split("|").map(Number);
     const firstOfMonth = new Date(year, month, 1);
-    // monthIndexDistance(a=now, b=month): 0 = current month, positive = future
     const fromNow = monthIndexDistance(now, firstOfMonth);
     if (fromNow >= 0) continue; // current (in-progress) or future month
-    rawEntries.push({ monthOf: firstOfMonth, key, total: round2(sum) });
+    rawEntries.push({ monthOf: firstOfMonth, key, totalPaise: sumPaise });
   }
   rawEntries.sort((a, b) => a.monthOf.getTime() - b.monthOf.getTime());
 
   const entries = rawEntries.map((e) => ({
     ...e,
+    total: e.totalPaise / 100, // display boundary
     label:
       e.monthOf.getTime() === rawEntries[rawEntries.length - 1].monthOf.getTime()
-        ? "Last Month" // newest completed month
-        : String(monthIndexDistance(rawEntries[0].monthOf, e.monthOf) + 1), // 1, 2, 3…
+        ? "Last Month"
+        : String(monthIndexDistance(rawEntries[0].monthOf, e.monthOf) + 1),
   }));
 
-  // Newest-first for display
   entries.sort((a, b) => b.monthOf.getTime() - a.monthOf.getTime());
   return entries;
 }
 
 /**
- * Greedy debt simplification: match largest creditor with largest debtor,
- * repeat until balanced. Returns list of { from, to, amount }.
+ * Greedy debt simplification in integer paise. Deterministic: debtors and
+ * creditors are sorted by amount descending, tie-break user_id ascending.
+ * Accepts either a paise map or a rupee map (legacy callers) — values are
+ * auto-detected when a map entry carries a non-integer value.
  */
-export function simplifyDebts(netCents) {
+export function simplifyDebts(netPaise) {
+  const entries = Object.entries(netPaise).map(([id, v]) => {
+    const n = Number(v);
+    return { id, paise: Number.isSafeInteger(n) ? n : Math.round(n * 100) };
+  });
   const debtors = [];
   const creditors = [];
-  for (const [id, amt] of Object.entries(netCents)) {
-    const cents = Math.round(amt * 100) / 100;
-    if (cents < -0.005) debtors.push({ id, amount: -cents });
-    else if (cents > 0.005) creditors.push({ id, amount: cents });
+  for (const { id, paise } of entries) {
+    if (paise < 0) debtors.push({ id, paise: -paise });
+    else if (paise > 0) creditors.push({ id, paise });
   }
-  debtors.sort((a, b) => b.amount - a.amount);
-  creditors.sort((a, b) => b.amount - a.amount);
+  debtors.sort((a, b) => b.paise - a.paise || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  creditors.sort((a, b) => b.paise - a.paise || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
   const transfers = [];
-  let i = 0,
-    j = 0;
+  let i = 0, j = 0;
   while (i < debtors.length && j < creditors.length) {
-    const payment = Math.min(debtors[i].amount, creditors[j].amount);
-    if (payment > 0.005) {
+    const payment = Math.min(debtors[i].paise, creditors[j].paise);
+    if (payment > 0) {
       transfers.push({
         from: debtors[i].id,
         to: creditors[j].id,
-        amount: round2(payment),
+        amount: payment / 100, // display boundary
+        amount_paise: payment,
       });
     }
-    debtors[i] = { ...debtors[i], amount: round2(debtors[i].amount - payment) };
-    creditors[j] = { ...creditors[j], amount: round2(creditors[j].amount - payment) };
-    if (debtors[i].amount < 0.005) i++;
-    if (creditors[j].amount < 0.005) j++;
+    debtors[i].paise -= payment;
+    creditors[j].paise -= payment;
+    if (debtors[i].paise === 0) i++;
+    if (creditors[j].paise === 0) j++;
   }
   return transfers;
 }

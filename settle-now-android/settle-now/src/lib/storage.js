@@ -1,4 +1,5 @@
 import { genUuid } from "./uid.js";
+import { toPaise } from "./money.js";
 
 const MEMBERS_KEY = "settle-now.members.v3";
 export const BILLS_KEY = "settle-now.bills.v3";
@@ -22,7 +23,7 @@ const API_BASE = (() => {
 // Bump CACHE_VERSION to wipe EVERY device's saved logins and cached data on
 // next load — used to give the deployed app a fresh start after a server wipe.
 // Each device runs this exactly once, then behaves normally.
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5;
 const CACHE_FLAG_KEY = "settle-now.cacheVersion";
 
 function ensureCacheVersion() {
@@ -36,6 +37,37 @@ function ensureCacheVersion() {
   } catch { /* storage unavailable — nothing to reset */ }
 }
 ensureCacheVersion();
+
+// ── Legacy bill migration (runs once per device) ─────────────────────
+// v4-and-earlier bills hold rupee floats and are always EQUAL across
+// splitAmongIds. Convert to the canonical integer-paise shape, persist the
+// converted value (idempotent), and re-push so server and client agree.
+function migrateLegacyBills() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(BILLS_KEY));
+    if (!Array.isArray(arr)) return;
+    let changed = false;
+    for (const b of arr) {
+      if (b && typeof b.amount_paise !== "number") {
+        const paise = toPaise(b.amount ?? 0);
+        if (!Number.isSafeInteger(paise)) continue;
+        b.amount_paise = paise;
+        b.splitType = b.splitType || "EQUAL";
+        b.payerParticipates = b.payerParticipates ?? true;
+        changed = true;
+        // fire-and-forget re-push of the converted bill
+        const converted = b;
+        pushBillToServer(converted).catch(() => { /* offline — will push on next edit */ });
+      }
+    }
+    if (changed) localStorage.setItem(BILLS_KEY, JSON.stringify(arr));
+  } catch { /* corrupt cache — next poll heals it */ }
+}
+
+const balancesCacheKey = (ledgerId) => `settle-now.balances.${ledgerId}`;
+
+// Run the one-time legacy-bill conversion at module load.
+migrateLegacyBills();
 
 // ── Members ────────────────────────────────────────────────────────────
 
@@ -117,7 +149,12 @@ export function loadBills(ledgerId) {
       // Coerce types — server may return strings from PostgreSQL
       if (typeof b.amount === "string") b.amount = Number(b.amount);
       if (typeof b.timestamp === "string") b.timestamp = Number(b.timestamp);
-      return typeof b.amount === "number" && typeof b.timestamp === "number";
+      // Canonical amount is amount_paise (migrated bills + server bills carry it)
+      if (typeof b.amount_paise !== "number" && typeof b.amount === "number") {
+        b.amount_paise = toPaise(b.amount);
+      }
+      return typeof b.timestamp === "number" &&
+        Number.isSafeInteger(b.amount_paise) && b.amount_paise >= 0;
     });
   } catch {
     return [];
@@ -136,20 +173,38 @@ export function appendBill(bill) {
   pushBillToServer(bill).catch((err) => console.error('[appendBill] server push failed:', err.message));
 }
 
-/** POST a bill to the backend for cross-device sync. */
+/** POST a bill to the backend for cross-device sync (integer paise wire format). */
 async function pushBillToServer(bill) {
   try {
+    const amount_paise = typeof bill.amount_paise === "number" ? bill.amount_paise : toPaise(bill.amount ?? 0);
+    if (!Number.isSafeInteger(amount_paise) || amount_paise <= 0) {
+      console.error('[pushBillToServer] invalid amount_paise, skipping push', bill.id);
+      return;
+    }
+    const payload = {
+      expense_id: bill.id,
+      paid_by: bill.payerId,
+      amount_paise,
+      split_among: bill.splitAmongIds || [],
+      description: bill.description || '',
+      split_type: bill.splitType || 'EQUAL',
+      payer_participates: bill.payerParticipates !== false,
+    };
+    // Non-EQUAL modes carry explicit shares — send them so the server stores
+    // exactly what the user saw (it re-validates through the same engine).
+    if ((bill.splitType || 'EQUAL') !== 'EQUAL' && Array.isArray(bill.shares)) {
+      payload.shares = bill.shares.map((s) => ({
+        user_id: s.userId ?? s.user_id,
+        amount_paise: s.amount_paise,
+        percent: s.percent,
+        weight: s.weight,
+      }));
+      payload.participant_ids = payload.split_among;
+    }
     const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(bill.ledgerId)}/expenses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        expense_id: bill.id,
-        paid_by: bill.payerId,
-        amount: bill.amount,
-        split_among: bill.splitAmongIds || [],
-        description: bill.description || '',
-        split_type: bill.splitType || 'EQUAL',
-      }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
@@ -171,6 +226,50 @@ export async function fetchBillsFromServer(ledgerId) {
     console.error('[fetchBillsFromServer] failed:', err.message);
     return null;
   }
+}
+
+// ── Server-authoritative balances ─────────────────────────────────────
+// The server derives nets/pairwise/suggestions/statuses/flags in integer
+// paise; the client adopts them verbatim (never recomputed for UI truth).
+
+/**
+ * Fetch the full balances derivation for a ledger and cache it locally.
+ * Returns the derivation object or null when unavailable.
+ */
+export async function fetchBalancesFromServer(ledgerId) {
+  try {
+    const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}/balances`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data || typeof data.nets !== 'object') return null;
+    localStorage.setItem(balancesCacheKey(ledgerId), JSON.stringify(data));
+    return data;
+  } catch (err) {
+    console.error('[fetchBalancesFromServer] failed:', err.message);
+    return null;
+  }
+}
+
+/** Last-cached server balances for a ledger (offline fallback), or null. */
+export function cachedBalances(ledgerId) {
+  try {
+    const raw = localStorage.getItem(balancesCacheKey(ledgerId));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Adopt the server's derivation into the local balances cache.
+ * Returns the adopted object (or the previous cache when server is null).
+ */
+export function mergeBalancesFromServer(ledgerId, derivation) {
+  if (derivation && typeof derivation.nets === 'object') {
+    localStorage.setItem(balancesCacheKey(ledgerId), JSON.stringify(derivation));
+    return derivation;
+  }
+  return cachedBalances(ledgerId);
 }
 
 /** Clear all bills for a ledger on the server. */
@@ -231,15 +330,27 @@ export function loadSettlements(ledgerId) {
 
 /**
  * Record a settlement: `fromUserId` paid `amount` to `toUserId`.
+ * amountPaise is canonical (integer paise); amount (rupees) is the legacy path.
+ * status: 'COMPLETED' (confirmed, clears the debt) or 'PENDING' (initiated,
+ * still counts against the balance until confirmed).
  * Saves locally and pushes to the server for cross-device sync (fire-and-forget).
  */
-export function appendSettlement({ ledgerId, fromUserId, toUserId, amount }) {
+export function appendSettlement({ ledgerId, fromUserId, toUserId, amountPaise, amount, status = 'COMPLETED', method = 'OTHER', note = '' }) {
+  const paise =
+    typeof amountPaise === 'number' && Number.isSafeInteger(amountPaise) && amountPaise > 0
+      ? amountPaise
+      : toPaise(amount ?? 0);
   const settlement = {
     id: genUuid(),
     ledgerId,
     fromUserId,
     toUserId,
-    amount: Math.round(amount * 100) / 100,
+    amount_paise: paise,
+    amount: paise / 100, // legacy display field
+    status,
+    method,
+    note,
+    settledAt: status === 'COMPLETED' ? Date.now() : null,
     timestamp: Date.now(),
   };
   const all = loadAllSettlements();
@@ -251,6 +362,22 @@ export function appendSettlement({ ledgerId, fromUserId, toUserId, amount }) {
   return settlement;
 }
 
+/** Transition a locally-cached settlement's lifecycle state and sync it. */
+export function updateSettlementStatus(ledgerId, settlementId, status) {
+  const all = loadAllSettlements();
+  const s = all.find((x) => x.id === settlementId && x.ledgerId === ledgerId);
+  if (!s) return null;
+  s.status = status;
+  if (status === 'COMPLETED' && !s.settledAt) s.settledAt = Date.now();
+  localStorage.setItem(SETTLEMENTS_KEY, JSON.stringify(all));
+  fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}/settlements/${encodeURIComponent(settlementId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status }),
+  }).catch((err) => console.error('[updateSettlementStatus] failed:', err.message));
+  return s;
+}
+
 async function pushSettlementToServer(s) {
   try {
     const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(s.ledgerId)}/settlements`, {
@@ -260,7 +387,10 @@ async function pushSettlementToServer(s) {
         settlement_id: s.id,
         from_user: s.fromUserId,
         to_user: s.toUserId,
-        amount: s.amount,
+        amount_paise: s.amount_paise,
+        status: s.status || 'COMPLETED',
+        method: s.method || 'OTHER',
+        note: s.note || '',
       }),
     });
     if (!res.ok) {
@@ -290,6 +420,10 @@ export async function mergeSettlementsFromServer(ledgerId) {
       if (!srv?.id || knownIds.has(srv.id)) continue;
       // Coerce types — server may return strings from PostgreSQL
       const amount = typeof srv.amount === 'string' ? Number(srv.amount) : srv.amount;
+      const amount_paise =
+        typeof srv.amount_paise === 'number'
+          ? srv.amount_paise
+          : toPaise(amount ?? 0);
       const ts = typeof srv.timestamp === 'string' ? Number(srv.timestamp) : srv.timestamp;
       all.push({
         id: srv.id,
@@ -297,6 +431,11 @@ export async function mergeSettlementsFromServer(ledgerId) {
         fromUserId: srv.fromUserId,
         toUserId: srv.toUserId,
         amount,
+        amount_paise,
+        status: srv.status || 'COMPLETED',
+        method: srv.method || 'OTHER',
+        note: srv.note || '',
+        settledAt: srv.settledAt ?? null,
         timestamp: ts,
       });
       knownIds.add(srv.id);
@@ -729,7 +868,8 @@ export async function fetchBalances(ledgerId) {
     const res = await fetch(`${API_BASE}/api/rooms/${encodeURIComponent(ledgerId)}/balances`);
     if (!res.ok) return null;
     const data = await res.json();
-    return data.balances || null;
+    // New shape carries `nets` in paise; legacy alias `balances` is rupees.
+    return data.balances || data.nets || null;
   } catch (err) {
     console.error('[fetchBalances] failed:', err.message);
     return null;
