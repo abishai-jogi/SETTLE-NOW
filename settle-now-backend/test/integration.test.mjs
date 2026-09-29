@@ -11,7 +11,23 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { allocate } from "../src/lib/splitEngine.js";
 
-process.env.DATABASE_URL ??= "postgres://settlenow:settlenow@127.0.0.1:5432/settlenow_test";
+// SAFETY: this suite TRUNCATES the database it runs against. Refuse to run
+// against anything that is not an explicitly disposable *_test database,
+// so a workspace DATABASE_URL (the live dev/prod data) can never be wiped.
+const dbUrl = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
+let dbName = "";
+try {
+  dbName = decodeURIComponent(new URL(dbUrl || "").pathname.replace(/^\//, ""));
+} catch { /* handled below */ }
+if (!dbUrl || !/_test([0-9]*)$/.test(dbName)) {
+  console.error(
+    "Refusing to run: these tests TRUNCATE the target database.\n" +
+    "Point TEST_DATABASE_URL (or DATABASE_URL) at a disposable *_test database, e.g.\n" +
+    "  TEST_DATABASE_URL=postgres://user:pass@host:5432/settlenow_test node test/integration.test.mjs"
+  );
+  process.exit(1);
+}
+process.env.DATABASE_URL = dbUrl;
 
 const { query, getPool } = await import("../src/db.js");
 const { default: app } = await import("../src/app.js");
