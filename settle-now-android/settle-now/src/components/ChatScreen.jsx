@@ -1,11 +1,23 @@
-import { useEffect, useRef, useState } from "react";
-import { CHIP_AMOUNTS } from "../config/people.js";
-import { contrastInk, dayKey, dayLabel, draftMoney, money } from "../lib/format.js";
-import { netBalances, simplifyDebts, sumSince } from "../lib/ledger.js";
-import { appendBill, clearBillsForLedger, clearBillsOnServer, appendSettlement, loadSettlements, mergeSettlementsFromServer } from "../lib/storage.js";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { dayKey, dayLabel } from "../lib/format.js";
+import { formatPaise } from "../lib/money.js";
+import { sumSince } from "../lib/ledger.js";
+import {
+  appendBill,
+  appendSettlement,
+  cachedBalances,
+  clearBillsForLedger,
+  clearBillsOnServer,
+  fetchBalancesFromServer,
+  loadSettlements,
+  mergeSettlementsFromServer,
+} from "../lib/storage.js";
 import { genUuid } from "../lib/uid.js";
 import MessageBubble from "./MessageBubble.jsx";
-import Numpad from "./Numpad.jsx";
+import SettlementBadge from "./SettlementBadge.jsx";
+import SettlementOverlay from "./SettlementOverlay.jsx";
+import ExpenseSheet from "./ExpenseSheet.jsx";
+import NumpadIcon from "./NumpadIcon.jsx";
 import MonthlyAverageBadge from "./MonthlyAverageBadge.jsx";
 import Footer from "./Footer.jsx";
 
@@ -21,339 +33,49 @@ function DayDivider({ ts }) {
   );
 }
 
-/* ── Floating Settlement Badge ──────────────────────────────────────── */
-function SettlementBadge({ status, onClick }) {
-  // status: "settled" | "owes" | "owed"
-  const bg =
-    status === "settled" ? "#4f6f52" : status === "owes" ? "#7a1e2a" : "#a98548";
-  const dot = status === "settled" ? "✓" : status === "owes" ? "↓" : "↑";
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label="Settlement status"
-      className="fixed left-4 top-[7rem] z-40 flex items-center gap-1.5 rounded-full px-3 py-1.5 shadow-lg transition active:scale-95"
-      style={{ backgroundColor: bg, color: "#f6f1e7" }}
-    >
-      <span className="text-xs font-bold leading-none">{dot}</span>
-      <span className="text-[9px] font-semibold uppercase tracking-[0.12em] leading-none">
-        STLMNT STS
-      </span>
-    </button>
-  );
-}
+const SPLIT_LABEL = {
+  EQUAL: null,
+  EXACT: "exact split",
+  PERCENT: "percent split",
+  SHARES: "weighted split",
+};
 
-/* ── Settlement Overlay ──────────────────────────────────────────────── */
-function SettlementOverlay({ user, members, transfers, netCents, onClose, onRecordSettlement }) {
-  const myNet = netCents[user.id] || 0;
-  const iOwe = transfers.filter((t) => t.from === user.id);
-  const owedToMe = transfers.filter((t) => t.to === user.id);
-  const isSettled = Math.abs(myNet) < 0.005 && iOwe.length === 0 && owedToMe.length === 0;
-  const nameOf = (id) => members.find((m) => m.id === id)?.name || "Unknown";
-
-  // Which transfer row is showing the two-option choice ("enter amount" / "totally cleared")
-  const [choosing, setChoosing] = useState(null); // { from, to, amount } | null
-  const [showPayNumpad, setShowPayNumpad] = useState(false);
-  const [payDraft, setPayDraft] = useState("");
-  const canPay = payDraft !== "" && Number.isFinite(Number(payDraft)) && Number(payDraft) > 0;
-
-  const chooseRow = (t) => {
-    setChoosing(t);
-    setPayDraft("");
-    setShowPayNumpad(false);
-  };
-
-  const recordPart = () => {
-    if (!choosing || !canPay) return;
-    onRecordSettlement({ from: choosing.from, to: choosing.to, amount: Number(payDraft) });
-    setChoosing(null);
-    setShowPayNumpad(false);
-    setPayDraft("");
-  };
-
-  const recordFull = () => {
-    if (!choosing) return;
-    onRecordSettlement({ from: choosing.from, to: choosing.to, amount: choosing.amount });
-    setChoosing(null);
-    setPayDraft("");
-  };
-
-  const row = (t, direction) => {
-    const otherId = direction === "owe" ? t.to : t.from;
-    const isChoosing = choosing && choosing.from === t.from && choosing.to === t.to;
-    return (
-      <div key={`${direction}-${t.from}-${t.to}`} className="space-y-1.5">
-        <button
-          type="button"
-          onClick={() => (isChoosing ? setChoosing(null) : chooseRow(t))}
-          className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition active:scale-[0.99]"
-          style={{ backgroundColor: direction === "owe" ? "rgba(122,30,42,0.06)" : "rgba(79,111,82,0.06)" }}
-        >
-          <span className="flex-1 text-sm text-charcoal">
-            {nameOf(otherId)}
-            {direction === "owe" ? " — you pay" : " — pays you"}
-          </span>
-          <span
-            className="font-display text-sm font-semibold"
-            style={{ color: direction === "owe" ? "#7a1e2a" : "#4f6f52" }}
-          >
-            {money(t.amount)}
-          </span>
-          <svg className="h-3.5 w-3.5 shrink-0 text-faded" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-            <path strokeLinecap="round" strokeLinejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5" />
-          </svg>
-        </button>
-
-        {isChoosing && (
-          <div className="pop-in mx-1 space-y-2 rounded-lg border border-gold/30 bg-ivory p-3">
-            <p className="text-[9px] uppercase tracking-[0.25em] text-faded">
-              How much is cleared with {nameOf(otherId)}?
-            </p>
-            {!showPayNumpad ? (
-              <div className="grid grid-cols-1 gap-2">
-                <button
-                  type="button"
-                  onClick={() => setShowPayNumpad(true)}
-                  className="flex items-center justify-center gap-2 rounded-lg border border-gold/50 bg-ivory px-3 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] text-charcoal shadow-sm transition hover:bg-gold/10 active:scale-[0.99]"
-                >
-                  {/* keypad icon */}
-                  <svg className="h-4 w-4 text-gold" viewBox="0 0 24 24" fill="currentColor">
-                    <rect x="2" y="2" width="4" height="4" rx="1" /><rect x="10" y="2" width="4" height="4" rx="1" /><rect x="18" y="2" width="4" height="4" rx="1" />
-                    <rect x="2" y="10" width="4" height="4" rx="1" /><rect x="10" y="10" width="4" height="4" rx="1" /><rect x="18" y="10" width="4" height="4" rx="1" />
-                    <rect x="2" y="18" width="4" height="4" rx="1" /><rect x="10" y="18" width="4" height="4" rx="1" /><rect x="18" y="18" width="4" height="4" rx="1" />
-                  </svg>
-                  Cleared amount
-                </button>
-                <button
-                  type="button"
-                  onClick={recordFull}
-                  className="flex items-center justify-center gap-2 rounded-lg bg-sage px-3 py-2.5 text-xs font-semibold uppercase tracking-[0.2em] text-ivory shadow-sm transition hover:opacity-90 active:scale-[0.99]"
-                >
-                  ✓ Totally cleared
-                </button>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-3 rounded-lg border border-charcoal/20 bg-ivory px-3 py-2 shadow-sm">
-                  <span className="whitespace-nowrap text-[10px] uppercase tracking-[0.25em] text-faded">
-                    You paid
-                  </span>
-                  <input
-                    readOnly
-                    tabIndex={-1}
-                    inputMode="none"
-                    value={draftMoney(payDraft)}
-                    placeholder="₹ 0"
-                    onMouseDown={(e) => e.preventDefault()}
-                    className="w-full min-w-0 bg-transparent text-right font-display text-xl tabular-nums text-charcoal outline-none placeholder:text-faded/50"
-                  />
-                </div>
-                <Numpad
-                  onKey={(k) =>
-                    setPayDraft((d) => {
-                      if (k === "back") return d.slice(0, -1);
-                      if (k === ".") {
-                        if (d.includes(".")) return d;
-                        return d === "" ? "0." : d + ".";
-                      }
-                      if (!/^\d$/.test(k)) return d;
-                      if (d.includes(".")) {
-                        return d.length - d.indexOf(".") <= 2 ? d + k : d;
-                      }
-                      if (d.length >= 7) return d;
-                      if (d === "0") return k;
-                      return d + k;
-                    })
-                  }
-                  onSend={recordPart}
-                  canSend={canPay}
-                  accentHex="#4f6f52"
-                  label="Cleared"
-                />
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-    );
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
-      <div className="absolute inset-0 bg-charcoal/50 backdrop-blur-sm" />
-      <div
-        className="pop-in relative z-10 mx-4 max-h-[85vh] w-full max-w-sm overflow-y-auto rounded-2xl border border-gold/30 bg-ivory p-6 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="mb-4 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <svg className="h-5 w-5 text-gold" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v12m-3-2.818.879.659 1.171-1.671.505.5A7.5 7.5 0 1 0 7.5 13.5" />
-            </svg>
-            <span className="text-sm font-semibold uppercase tracking-[0.2em] text-gold">
-              Settlement Status
-            </span>
-          </div>
-          <button type="button" onClick={onClose} className="rounded-full p-1 text-faded transition hover:bg-charcoal/10">
-            <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-
-        {isSettled ? (
-          <div className="flex items-center gap-3 rounded-xl bg-sage/10 px-4 py-4">
-            <span className="text-2xl">✨</span>
-            <p className="text-sm font-medium text-sage">You're fully settled — no balance owed.</p>
-          </div>
-        ) : (
-          <div className="space-y-4">
-            {iOwe.length > 0 && (
-              <div>
-                <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-wine">You owe</p>
-                <div className="space-y-1.5">{iOwe.map((t) => row(t, "owe"))}</div>
-              </div>
-            )}
-            {owedToMe.length > 0 && (
-              <div>
-                <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-sage">You're owed</p>
-                <div className="space-y-1.5">{owedToMe.map((t) => row(t, "owed"))}</div>
-              </div>
-            )}
-            <p className="pt-1 text-center text-[9px] italic text-faded">
-              Tap a row to record a payment and update balances.
-            </p>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/* ── Floating Numpad Icon ────────────────────────────────────────────── */
-function NumpadIcon({ onClick, accentHex }) {
-  const fg = contrastInk(accentHex);
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label="Open numeric keypad"
-      className="fixed right-4 bottom-6 z-40 flex h-14 w-14 items-center justify-center rounded-full shadow-lg transition active:scale-95"
-      style={{ backgroundColor: accentHex, color: fg }}
-    >
-      {/* Numpad grid icon */}
-      <svg className="h-6 w-6" viewBox="0 0 24 24" fill="currentColor">
-        <rect x="2" y="2" width="4" height="4" rx="1" />
-        <rect x="10" y="2" width="4" height="4" rx="1" />
-        <rect x="18" y="2" width="4" height="4" rx="1" />
-        <rect x="2" y="10" width="4" height="4" rx="1" />
-        <rect x="10" y="10" width="4" height="4" rx="1" />
-        <rect x="18" y="10" width="4" height="4" rx="1" />
-        <rect x="2" y="18" width="4" height="4" rx="1" />
-        <rect x="10" y="18" width="4" height="4" rx="1" />
-        <rect x="18" y="18" width="4" height="4" rx="1" />
-      </svg>
-    </button>
-  );
-}
-
-/* ── Numpad Bottom Sheet ─────────────────────────────────────────────── */
-function NumpadSheet({ user, draft, setDraft, onSend, canSend, onClose }) {
-  const press = (k) => {
-    setDraft((d) => {
-      if (k === "back") return d.slice(0, -1);
-      if (k === ".") {
-        if (d.includes(".")) return d;
-        return d === "" ? "0." : d + ".";
-      }
-      if (!/^\d$/.test(k)) return d;
-      if (d.includes(".")) {
-        return d.length - d.indexOf(".") <= 2 ? d + k : d;
-      }
-      if (d.length >= 7) return d;
-      if (d === "0") return k;
-      return d + k;
-    });
-  };
-
-  const onChipTap = (amount) => setDraft(String(amount));
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-end" onClick={onClose}>
-      <div className="absolute inset-0" />
-      <div
-        className="pop-in relative z-10 w-full rounded-t-2xl bg-parchment shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* Handle */}
-        <div className="flex justify-center pt-3">
-          <div className="h-1 w-8 rounded-full bg-charcoal/15" />
-        </div>
-
-        <div className="mx-auto max-w-3xl space-y-2 px-3 pb-4 pt-2">
-          {/* Chips */}
-          <div className="no-scrollbar flex gap-1.5 overflow-x-auto">
-            {CHIP_AMOUNTS.map((amt) => (
-              <button
-                key={amt}
-                type="button"
-                onClick={() => onChipTap(amt)}
-                className="shrink-0 rounded-full border border-gold/50 bg-ivory px-4 py-1.5 text-sm text-ink shadow-sm transition hover:bg-gold/15 active:scale-95"
-              >
-                ₹{amt}
-              </button>
-            ))}
-          </div>
-
-          {/* Amount field */}
-          <div className="flex items-center justify-between gap-3 rounded-lg border border-charcoal/20 bg-ivory px-4 py-2 shadow-sm">
-            <span className="whitespace-nowrap text-[10px] uppercase tracking-[0.25em] text-faded">
-              {user.name} pays
-            </span>
-            <input
-              readOnly
-              tabIndex={-1}
-              inputMode="none"
-              value={draftMoney(draft)}
-              placeholder="₹ 0"
-              onMouseDown={(e) => e.preventDefault()}
-              className="w-full min-w-0 bg-transparent text-right font-display text-2xl tabular-nums text-charcoal outline-none placeholder:text-faded/50"
-            />
-          </div>
-
-          {/* Numpad */}
-          <Numpad
-            onKey={press}
-            onSend={() => { onSend(); onClose(); }}
-            canSend={canSend}
-            accentHex={user.color}
-            label={canSend ? `Record ${draftMoney(draft)}` : "Record payment"}
-          />
-        </div>
-      </div>
-    </div>
-  );
-}
+const payerLabel = (bill, payerParticipates) => {
+  if (payerParticipates) return SPLIT_LABEL[bill.splitType || "EQUAL"];
+  return SPLIT_LABEL[bill.splitType || "EQUAL"]
+    ? `${SPLIT_LABEL[bill.splitType || "EQUAL"]} · payer excluded`
+    : "payer not splitting";
+};
 
 /* ── Main ChatScreen ─────────────────────────────────────────────────── */
 export default function ChatScreen({ user, members, ledger, bills, onRefreshBills, onBack, onLogout, onClear, onMonthlyTotals, onMonthlyHistory }) {
-  const [draft, setDraft] = useState("");
   const [showSettlement, setShowSettlement] = useState(false);
-  const [showNumpad, setShowNumpad] = useState(false);
+  const [showExpenseSheet, setShowExpenseSheet] = useState(false);
   const [settlements, setSettlements] = useState(() => loadSettlements(ledger.id));
+  const [serverBalances, setServerBalances] = useState(() => cachedBalances(ledger.id));
   const endRef = useRef(null);
 
-  const balances = netBalances(bills, members, settlements);
-  const balance = balances[user.id] || 0;
-  const transfers = simplifyDebts(balances);
   const monthlyAvg = sumSince(bills, user.id, 30);
-  const canSend = draft !== "" && Number.isFinite(Number(draft)) && Number(draft) > 0;
 
-  // Settlement icon status
-  const myNet = balances[user.id] || 0;
-  const iOwe = transfers.some((t) => t.from === user.id);
-  const owedToMe = transfers.some((t) => t.to === user.id);
-  const settlementStatus = iOwe ? "owes" : owedToMe ? "owed" : "settled";
+  // ── Server-authoritative status: NEVER recomputed locally for the UI. ──
+  // serverBalances.nets / statuses / flags / pairwise / suggestions come from
+  // GET /balances (integer paise) and are adopted verbatim; the offline cache
+  // is the only fallback. legacy `balances` map (rupees) used for the banner.
+  const loadBalances = useCallback(async () => {
+    const derivation = await fetchBalancesFromServer(ledger.id);
+    if (derivation) setServerBalances(derivation);
+  }, [ledger.id]);
+
+  useEffect(() => {
+    setSettlements(loadSettlements(ledger.id));
+    setServerBalances(cachedBalances(ledger.id));
+    loadBalances();
+  }, [ledger.id, loadBalances]);
+
+  const net = serverBalances?.nets?.[user.id] ?? 0; // integer paise
+  const balance = net / 100; // display boundary only
+  const status = serverBalances?.statuses?.[user.id] ?? "settled";
+  const partiallySettled = serverBalances?.flags?.[user.id]?.partially_settled ?? false;
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -370,26 +92,35 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
     };
   }, [ledger.id]);
 
-  // Record a debt payment: updates balances instantly (local) + syncs to server
-  const recordSettlement = ({ from, to, amount }) => {
-    if (!(amount > 0)) return;
-    appendSettlement({ ledgerId: ledger.id, fromUserId: from, toUserId: to, amount });
+  // Refresh the server derivation whenever the ledger content changes
+  // (bills list length or settlements list length moved).
+  useEffect(() => {
+    loadBalances();
+  }, [bills.length, settlements.length, loadBalances]);
+
+  // Record a debt payment: paise in, lifecycle state on the wire
+  const recordSettlement = ({ from, to, amountPaise, status: st }) => {
+    if (!(amountPaise > 0)) return;
+    appendSettlement({
+      ledgerId: ledger.id,
+      fromUserId: from,
+      toUserId: to,
+      amountPaise,
+      status: st || "COMPLETED",
+    });
     setSettlements(loadSettlements(ledger.id));
     onRefreshBills();
   };
 
-  const send = () => {
-    const amount = Number(draft);
-    if (!Number.isFinite(amount) || amount <= 0) return;
+  const send = (billSpec) => {
     appendBill({
       id: genUuid(),
       ledgerId: ledger.id,
       payerId: user.id,
-      amount: Math.round(amount * 100) / 100,
       timestamp: Date.now(),
-      splitAmongIds: members.map((m) => m.id),
+      description: "",
+      ...billSpec,
     });
-    setDraft("");
     onRefreshBills();
   };
 
@@ -448,14 +179,14 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
               <span className="truncate text-[10px] uppercase tracking-[0.25em] text-ivory/60">
                 Signed in as {user.name}
               </span>
-              {/* Balance banner */}
+              {/* Balance banner — server-derived, integer paise underneath */}
               {balance > 0 ? (
                 <span className="rounded-full border border-sage/50 bg-sage/10 px-4 py-1.5 text-sm tabular-nums text-sage">
-                  You get back {money(balance)}
+                  You get back {formatPaise(net)}
                 </span>
               ) : balance < 0 ? (
                 <span className="rounded-full border border-wine/50 bg-wine/10 px-4 py-1.5 text-sm tabular-nums text-wine">
-                  You owe {money(-balance)}
+                  You owe {formatPaise(-net)}
                 </span>
               ) : (
                 <span className="rounded-full border border-gold/50 bg-gold/10 px-4 py-1.5 text-sm text-gold">
@@ -467,15 +198,15 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
         </div>
       </header>
 
-      {/* Scrollable chat area — no settlement bubble, no docked footer */}
+      {/* Scrollable chat area */}
       <main className="mx-auto w-full max-w-3xl flex-1 overflow-y-auto px-4 pb-24 pt-2">
         {bills.length === 0 ? (
           <div className="flex flex-col items-center py-16 text-center">
             <p className="font-display text-2xl text-charcoal/70">An empty ledger.</p>
             <div className="gold-hairline my-4 w-32" />
             <p className="max-w-xs text-sm italic leading-relaxed text-faded">
-              Tap the numpad icon below to record the first payment — it will be
-              divided equally among all {members.length} members.
+              Tap the numpad icon below to record the first payment — choose who's
+              splitting and how (equal, exact, percent or shares).
             </p>
           </div>
         ) : (
@@ -484,10 +215,16 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
             const newDay = !prev || dayKey(prev.timestamp) !== dayKey(b.timestamp);
             const payer = members.find((m) => m.id === b.payerId);
             if (!payer) return null;
+            const participates = b.payerParticipates ?? b.payer_participates ?? true;
             return (
               <div key={b.id}>
                 {newDay && <DayDivider ts={b.timestamp} />}
-                <MessageBubble bill={b} person={payer} mine={b.payerId === user.id} />
+                <MessageBubble
+                  bill={b}
+                  person={payer}
+                  mine={b.payerId === user.id}
+                  splitLabel={payerLabel(b, participates)}
+                />
               </div>
             );
           })
@@ -496,33 +233,37 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
         <Footer />
       </main>
 
-      {/* Floating Settlement Badge (top-left) */}
-      <SettlementBadge status={settlementStatus} onClick={() => setShowSettlement(true)} />
+      {/* Floating Settlement Badge (top-left) — server statuses + flags */}
+      <SettlementBadge
+        status={status}
+        partiallySettled={partiallySettled}
+        onClick={() => setShowSettlement(true)}
+      />
 
       {/* Floating Numpad Icon (bottom-right) */}
-      <NumpadIcon onClick={() => setShowNumpad(true)} accentHex={user.color} />
+      <NumpadIcon onClick={() => setShowExpenseSheet(true)} accentHex={user.color} />
 
-      {/* Settlement Overlay */}
+      {/* Settlement Overlay — people-wise / group-wise */}
       {showSettlement && (
         <SettlementOverlay
           user={user}
           members={members}
-          transfers={transfers}
-          netCents={balances}
+          balances={serverBalances}
           onClose={() => setShowSettlement(false)}
           onRecordSettlement={recordSettlement}
         />
       )}
 
-      {/* Numpad Bottom Sheet */}
-      {showNumpad && (
-        <NumpadSheet
+      {/* Add-expense bottom sheet with split modes */}
+      {showExpenseSheet && (
+        <ExpenseSheet
           user={user}
-          draft={draft}
-          setDraft={setDraft}
-          onSend={send}
-          canSend={canSend}
-          onClose={() => { setShowNumpad(false); setDraft(""); }}
+          members={members}
+          onSend={(billSpec) => {
+            send(billSpec);
+            setShowExpenseSheet(false);
+          }}
+          onClose={() => setShowExpenseSheet(false)}
         />
       )}
     </div>

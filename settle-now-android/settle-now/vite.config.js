@@ -10,7 +10,9 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       "/api": {
-        target: "http://localhost:4000",
+        // BACKEND_PORT lets the API sit beside the Vite dev server when a
+        // managed environment injects its own PORT; default stays 4000.
+        target: `http://localhost:${process.env.BACKEND_PORT || 4000}`,
         changeOrigin: true,
       },
     },

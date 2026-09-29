@@ -104,9 +104,11 @@ export default function StatsDrawer({ open, onClose, userId, members, bills, onC
             </div>
 
             <p className="text-[10px] italic leading-relaxed text-faded">
-              Week = trailing 7 days &middot; Month = trailing 30 days. Net is the
-              simplified settlement against the group; each bill was split
-              equally among the members active when it was logged.
+              Week = trailing 7 days &middot; Month = trailing 30 days. Net is
+              your settlement position against the group. Each bill uses the
+              split recorded with it — equal, exact amounts, percentages or
+              weights — and only the members picked for that bill; the payer
+              can be excluded entirely.
             </p>
           </div>
 

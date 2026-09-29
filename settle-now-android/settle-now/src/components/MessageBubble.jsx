@@ -1,7 +1,17 @@
 import { clock, contrastInk } from "../lib/format.js";
+import { money } from "../lib/format.js";
 import Avatar from "./Avatar.jsx";
 
-export default function MessageBubble({ bill, person, mine }) {
+const fmtPaise = (paise, fallback) =>
+  Number.isSafeInteger(paise)
+    ? money(paise / 100)
+    : fallback;
+
+/**
+ * Expense bubble. The bill is "mine" when the signed-in user fronted it.
+ * Shows the payer, the total, and the split mode it was logged with.
+ */
+export default function MessageBubble({ bill, person, mine, splitLabel }) {
   const fg = contrastInk(person.color);
   return (
     <div
@@ -38,8 +48,16 @@ export default function MessageBubble({ bill, person, mine }) {
             className="mt-0.5 font-display text-[1.35rem] leading-snug tabular-nums"
             style={{ color: fg }}
           >
-            ₹{Number(bill.amount).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {fmtPaise(bill.amount_paise, `₹${Number(bill.amount).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)}
           </div>
+          {splitLabel && (
+            <div
+              className="mt-0.5 text-[9px] uppercase tracking-[0.18em]"
+              style={{ color: fg, opacity: 0.6 }}
+            >
+              {splitLabel}
+            </div>
+          )}
         </div>
       </div>
     </div>
