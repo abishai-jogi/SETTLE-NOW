@@ -95,4 +95,50 @@ assert.equal(hist[0].total, 250.5);
 // ── allocate accessible from the client copy ──
 assert.equal(allocate({ amountPaise: 100, userIds: ["a", "b", "c"] }).ok, true);
 
+// ── Bill normalisation: shares must resolve for every shape a bill can take
+//    on the wire or in localStorage, and must always add up to the amount.
+test_shares_resolve_for_every_shape();
+function test_shares_resolve_for_every_shape() {
+  const ids = ["a", "b", "c"];
+
+  // server-shaped EQUAL bill (shares_paise present)
+  const equal = normalizeBill({
+    amount_paise: 10000, splitType: "EQUAL", payerId: "a",
+    splitAmongIds: ids, timestamp: Date.now(),
+  });
+  assert.equal(sumShares(equal), 10000);
+
+  // legacy rupee-float bill (no paise, no shares) — sheet must still resolve
+  const legacy = normalizeBill({
+    amount: 100, splitAmongIds: ids, payerId: "a", timestamp: Date.now(),
+  });
+  assert.equal(legacy.amount_paise, 10000);
+  assert.equal(sumShares(legacy), 10000);
+
+  // EXACT, PERCENT and SHARES with the server's resolved shares
+  for (const [type, shares] of [
+    ["EXACT", [{ user_id: "a", share_paise: 5000 }, { user_id: "b", share_paise: 3000 }, { user_id: "c", share_paise: 2000 }]],
+    ["PERCENT", [{ user_id: "a", share_paise: 3300 }, { user_id: "b", share_paise: 3300 }, { user_id: "c", share_paise: 3400 }]],
+    ["SHARES", [{ user_id: "a", share_paise: 2500 }, { user_id: "b", share_paise: 5000 }, { user_id: "c", share_paise: 2500 }]],
+  ]) {
+    const b = normalizeBill({
+      amount_paise: 10000, splitType: type, payerId: "a",
+      splitAmongIds: ids, shares_paise: shares, timestamp: Date.now(),
+    });
+    assert.equal(sumShares(b), 10000, `${type} shares must add up to the amount`);
+  }
+
+  // payer excluded: the payer's own row is simply absent
+  const excluded = normalizeBill({
+    amount_paise: 100000, splitType: "EQUAL", payerId: "a", payerParticipates: false,
+    splitAmongIds: ["b", "c"], timestamp: Date.now(),
+  });
+  assert.ok(!excluded.shares_paise.some((s) => s.user_id === "a"), "payer must not be listed");
+  assert.equal(sumShares(excluded), 100000);
+}
+
+function sumShares(b) {
+  return b.shares_paise.reduce((s, x) => s + x.share_paise, 0);
+}
+
 console.log("client money-path smoke: all assertions passed");

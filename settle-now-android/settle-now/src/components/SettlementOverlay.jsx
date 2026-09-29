@@ -1,56 +1,38 @@
 import { useState } from "react";
 import { draftMoney } from "../lib/format.js";
 import { formatPaise } from "../lib/money.js";
+import { buildSettlementView } from "../lib/settlementsView.js";
 import Numpad from "./Numpad.jsx";
 
 /**
- * Settlement overlay — two views of the same debt, never contradictory.
+ * Settlement overlay — every "you owe" and "you're owed" in one list.
  *
- * Group-wise : the server's minimal transfer set (`suggestions`) — settle the
- *              whole group in the fewest possible payments.
- * People-wise: the server's pairwise matrix filtered to the signed-in user —
- *              settle with one specific person directly.
+ * Rows come straight from the server's pairwise matrix (integer paise), so
+ * they always agree with the balance shown in the header. No tabs, no modes.
  *
- * Both write through recordSettlement with integer paise. "Totally cleared"
- * sends the exact outstanding paise for that row rather than a float compare.
+ * Clearing a row (partial or total) belongs to the person who OWES: only
+ * "You owe" rows are actionable. The "You're owed" side is read-only — what
+ * you do about that is between you and them, not a button in your ledger.
+ *
+ * "Totally cleared" sends the exact outstanding paise for that row rather
+ * than a float comparison.
  */
 export default function SettlementOverlay({
   user,
   members,
-  balances,       // server derivation: { suggestions, pairwise, nets, statuses, flags }
+  balances,          // server derivation: { nets, pairwise, suggestions, statuses, flags }
   onClose,
   onRecordSettlement, // ({ from, to, amountPaise }) => void
-  onConfirmSettlement, // (settlementId, status) => void  (pending rows)
 }) {
-  const [tab, setTab] = useState("group"); // "group" | "people"
-  const [choosing, setChoosing] = useState(null); // { from, to, amountPaise }
+  const [choosing, setChoosing] = useState(null); // { from, to, amountPaise, other }
   const [showPayNumpad, setShowPayNumpad] = useState(false);
   const [payDraft, setPayDraft] = useState("");
   const canPay = payDraft !== "" && Number.isFinite(Number(payDraft)) && Number(payDraft) > 0;
 
   const nameOf = (id) => members.find((m) => m.id === id)?.name || "Unknown";
 
-  const myNetPaise = balances?.nets?.[user.id] || 0;
-  const suggestions = (balances?.suggestions || []).map((s) => ({
-    from: s.from,
-    to: s.to,
-    amountPaise: s.amount_paise ?? Math.round((s.amount || 0) * 100),
-  }));
-  // People-wise: pairwise rows involving me with a real outstanding amount,
-  // oriented from my perspective (positive = I receive, negative = I pay).
-  const myPairs = (balances?.pairwise || [])
-    .filter((p) => p.outstanding_a_to_b_paise > 0)
-    .map((p) => {
-      const row = p.a === user.id
-        ? { other: p.b, iPay: p.outstanding_a_to_b_paise }
-        : p.b === user.id
-          ? { other: p.a, iPay: 0, iReceive: p.outstanding_a_to_b_paise }
-          : null;
-      return row;
-    })
-    .filter(Boolean);
-
-  const isSettled = myNetPaise === 0 && suggestions.length === 0 && myPairs.length === 0;
+  // One list of everything outstanding for this person, both directions.
+  const { iOwe, owedToMe, isSettled } = buildSettlementView(user.id, balances);
 
   const chooseRow = (t) => {
     setChoosing(t);
@@ -60,7 +42,7 @@ export default function SettlementOverlay({
 
   const recordPart = () => {
     if (!choosing || !canPay) return;
-    onRecordSettlement({ from: choosing.from, to: choosing.to, amountPaise: Math.round(Number(payDraft) * 100) });
+    onRecordSettlement({ from: user.id, to: choosing.other, amountPaise: Math.round(Number(payDraft) * 100) });
     setChoosing(null);
     setShowPayNumpad(false);
     setPayDraft("");
@@ -68,31 +50,23 @@ export default function SettlementOverlay({
 
   const recordFull = () => {
     if (!choosing) return;
-    onRecordSettlement({ from: choosing.from, to: choosing.to, amountPaise: choosing.amountPaise });
+    onRecordSettlement({ from: user.id, to: choosing.other, amountPaise: choosing.amountPaise });
     setChoosing(null);
     setPayDraft("");
   };
 
-  const row = ({ from, to, amountPaise }) => {
-    const direction = from === user.id ? "owe" : "owed";
-    const otherId = direction === "owe" ? to : from;
-    const isChoosing = choosing && choosing.from === from && choosing.to === to && choosing.amountPaise === amountPaise;
+  // ── "You owe" row — actionable (you are the payer of this debt) ──
+  const oweRow = ({ other, amountPaise }) => {
+    const isChoosing = choosing?.other === other;
     return (
-      <div key={`${from}-${to}`} className="space-y-1.5">
+      <div key={`owe-${other}`} className="space-y-1.5">
         <button
           type="button"
-          onClick={() => (isChoosing ? setChoosing(null) : chooseRow({ from, to, amountPaise }))}
-          className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition active:scale-[0.99]"
-          style={{ backgroundColor: direction === "owe" ? "rgba(122,30,42,0.06)" : "rgba(79,111,82,0.06)" }}
+          onClick={() => (isChoosing ? setChoosing(null) : chooseRow({ other, amountPaise }))}
+          className="flex w-full items-center gap-3 rounded-lg bg-wine/[0.06] px-3 py-2 text-left transition active:scale-[0.99]"
         >
-          <span className="flex-1 text-sm text-charcoal">
-            {nameOf(otherId)}
-            {direction === "owe" ? " — you pay" : " — pays you"}
-          </span>
-          <span
-            className="font-display text-sm font-semibold tabular-nums"
-            style={{ color: direction === "owe" ? "#7a1e2a" : "#4f6f52" }}
-          >
+          <span className="min-w-0 flex-1 truncate text-sm text-charcoal">{nameOf(other)}</span>
+          <span className="font-display text-sm font-semibold tabular-nums text-wine">
             {formatPaise(amountPaise)}
           </span>
           <svg className="h-3.5 w-3.5 shrink-0 text-faded" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -103,7 +77,7 @@ export default function SettlementOverlay({
         {isChoosing && (
           <div className="pop-in mx-1 space-y-2 rounded-lg border border-gold/30 bg-ivory p-3">
             <p className="text-[9px] uppercase tracking-[0.25em] text-faded">
-              How much is cleared with {nameOf(otherId)}?
+              How much are you clearing with {nameOf(other)}?
             </p>
             {!showPayNumpad ? (
               <div className="grid grid-cols-1 gap-2">
@@ -173,6 +147,19 @@ export default function SettlementOverlay({
     );
   };
 
+  // ── "You're owed" row — read-only (the other person is the debtor) ──
+  const owedRow = ({ other, amountPaise }) => (
+    <div
+      key={`owed-${other}`}
+      className="flex w-full items-center gap-3 rounded-lg bg-sage/[0.06] px-3 py-2"
+    >
+      <span className="min-w-0 flex-1 truncate text-sm text-charcoal">{nameOf(other)}</span>
+      <span className="font-display text-sm font-semibold tabular-nums text-sage">
+        {formatPaise(amountPaise)}
+      </span>
+    </div>
+  );
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
       <div className="absolute inset-0 bg-charcoal/50 backdrop-blur-sm" />
@@ -196,95 +183,36 @@ export default function SettlementOverlay({
           </button>
         </div>
 
-        {/* People-wise / Group-wise tab switch */}
-        <div className="mb-4 grid grid-cols-2 gap-1 rounded-lg bg-charcoal/5 p-1">
-          {[
-            { key: "group", label: "Group-wise" },
-            { key: "people", label: "People-wise" },
-          ].map(({ key, label }) => (
-            <button
-              key={key}
-              type="button"
-              onClick={() => { setTab(key); setChoosing(null); setShowPayNumpad(false); }}
-              className={`rounded-md px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.18em] transition ${
-                tab === key ? "bg-charcoal text-ivory shadow-sm" : "text-faded hover:text-charcoal"
-              }`}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-
         {isSettled ? (
           <div className="flex items-center gap-3 rounded-xl bg-sage/10 px-4 py-4">
             <span className="text-2xl">✨</span>
-            <p className="text-sm font-medium text-sage">You're fully settled — no balance owed.</p>
-          </div>
-        ) : tab === "group" ? (
-          <div className="space-y-4">
-            {suggestions.filter((t) => t.from === user.id || t.to === user.id).length > 0 ? (
-              <>
-                <div>
-                  {suggestions.some((t) => t.from === user.id) && (
-                    <div>
-                      <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-wine">You owe</p>
-                      <div className="space-y-1.5">
-                        {suggestions.filter((t) => t.from === user.id).map((t) => row(t))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-                {suggestions.some((t) => t.to === user.id) && (
-                  <div>
-                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-sage">You're owed</p>
-                    <div className="space-y-1.5">
-                      {suggestions.filter((t) => t.to === user.id && t.from !== user.id).map((t) => row(t))}
-                    </div>
-                  </div>
-                )}
-              </>
-            ) : (
-              <p className="py-2 text-center text-xs italic text-faded">
-                Nothing to settle between you and the group directly — other members'
-                balances cancel each other out.
-              </p>
-            )}
-            <p className="pt-1 text-center text-[9px] italic text-faded">
-              Group-wise: the fewest payments that clear everyone.
-            </p>
+            <div>
+              <p className="text-sm font-medium text-sage">You're fully settled — no balance owed.</p>
+              {!balances && (
+                <p className="mt-1 text-[10px] italic text-faded">
+                  Nothing outstanding in this ledger.
+                </p>
+              )}
+            </div>
           </div>
         ) : (
           <div className="space-y-4">
-            {myPairs.length > 0 ? (
-              <>
-                {myPairs.some((p) => p.iPay > 0) && (
-                  <div>
-                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-wine">You owe</p>
-                    <div className="space-y-1.5">
-                      {myPairs.filter((p) => p.iPay > 0).map((p) =>
-                        row({ from: user.id, to: p.other, amountPaise: p.iPay })
-                      )}
-                    </div>
-                  </div>
-                )}
-                {myPairs.some((p) => p.iReceive > 0) && (
-                  <div>
-                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-sage">You're owed</p>
-                    <div className="space-y-1.5">
-                      {myPairs.filter((p) => p.iReceive > 0).map((p) =>
-                        row({ from: p.other, to: user.id, amountPaise: p.iReceive })
-                      )}
-                    </div>
-                  </div>
-                )}
-              </>
-            ) : (
-              <p className="py-2 text-center text-xs italic text-faded">
-                No one-on-one balances — nothing owed to or from any single member.
-              </p>
+            {iOwe.length > 0 && (
+              <div>
+                <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-wine">You owe</p>
+                <div className="space-y-1.5">{iOwe.map((r) => oweRow(r))}</div>
+              </div>
+            )}
+            {owedToMe.length > 0 && (
+              <div>
+                <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-sage">You're owed</p>
+                <div className="space-y-1.5">{owedToMe.map((r) => owedRow(r))}</div>
+              </div>
             )}
             <p className="pt-1 text-center text-[9px] italic text-faded">
-              People-wise: your direct one-on-one balance with each member.
+              {iOwe.length > 0
+                ? "Tap what you owe to record a payment."
+                : "Waiting on the people you lent to."}
             </p>
           </div>
         )}

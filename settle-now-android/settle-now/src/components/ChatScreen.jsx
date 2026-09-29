@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { dayKey, dayLabel } from "../lib/format.js";
 import { formatPaise } from "../lib/money.js";
-import { sumSince } from "../lib/ledger.js";
+import { sumSince, deriveBalances } from "../lib/ledger.js";
+import { buildSettlementView } from "../lib/settlementsView.js";
 import {
   appendBill,
   appendSettlement,
@@ -57,10 +58,11 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
 
   const monthlyAvg = sumSince(bills, user.id, 30);
 
-  // ── Server-authoritative status: NEVER recomputed locally for the UI. ──
-  // serverBalances.nets / statuses / flags / pairwise / suggestions come from
-  // GET /balances (integer paise) and are adopted verbatim; the offline cache
-  // is the only fallback. legacy `balances` map (rupees) used for the banner.
+  // ── Server-authoritative status, with an honest offline fallback. ──
+  // serverBalances.nets / statuses / flags / pairwise come from
+  // GET /balances (integer paise) and are adopted verbatim. If the server is
+  // unreachable we derive the SAME shape locally from cached bills, so the
+  // screen never claims "fully settled" just because a request failed.
   const loadBalances = useCallback(async () => {
     const derivation = await fetchBalancesFromServer(ledger.id);
     if (derivation) setServerBalances(derivation);
@@ -72,10 +74,15 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
     loadBalances();
   }, [ledger.id, loadBalances]);
 
-  const net = serverBalances?.nets?.[user.id] ?? 0; // integer paise
+  const derivation = useMemo(
+    () => serverBalances ?? deriveBalances(bills, members, settlements),
+    [serverBalances, bills, members, settlements]
+  );
+  const view = buildSettlementView(user.id, derivation);
+  const net = view.netPaise; // integer paise
   const balance = net / 100; // display boundary only
-  const status = serverBalances?.statuses?.[user.id] ?? "settled";
-  const partiallySettled = serverBalances?.flags?.[user.id]?.partially_settled ?? false;
+  const status = view.status;
+  const partiallySettled = view.partiallySettled;
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -243,12 +250,12 @@ export default function ChatScreen({ user, members, ledger, bills, onRefreshBill
       {/* Floating Numpad Icon (bottom-right) */}
       <NumpadIcon onClick={() => setShowExpenseSheet(true)} accentHex={user.color} />
 
-      {/* Settlement Overlay — people-wise / group-wise */}
+      {/* Settlement Overlay — every owe and owed in one list */}
       {showSettlement && (
         <SettlementOverlay
           user={user}
           members={members}
-          balances={serverBalances}
+          balances={derivation}
           onClose={() => setShowSettlement(false)}
           onRecordSettlement={recordSettlement}
         />

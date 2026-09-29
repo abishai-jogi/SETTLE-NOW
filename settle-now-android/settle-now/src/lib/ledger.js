@@ -156,6 +156,93 @@ export function monthlyHistory(bills, now = new Date()) {
 }
 
 /**
+ * Local fallback derivation — the same SHAPE the server returns
+ * ({ nets, statuses, flags, pairwise }) in integer paise.
+ *
+ * The server stays the source of truth whenever it is reachable. This exists
+ * so the settlement screen can never show a confident "you're fully settled"
+ * just because a request failed: a local-first app must still show the debts
+ * it knows about while offline. Deliberately mirrors the server's rules —
+ * pairwise rows per unordered pair with `a` = lexicographically smaller id,
+ * PENDING and COMPLETED settlements reduce the balance, VOID does not.
+ */
+export function deriveBalances(bills, members, settlements = []) {
+  const nets = {};
+  const bump = (map, key, v) => { map[key] = (map[key] || 0) + v; };
+
+  const owedPair = {};   // "participant|payer" → that participant owes the payer
+  const settledPair = {}; // "from|to"        → settled that way
+  const pendingTouch = new Set();
+
+  for (const raw of bills) {
+    const b = normalizeBill(raw);
+    if (!b) continue;
+    if (!(b.payerId in nets)) nets[b.payerId] = 0;
+    nets[b.payerId] += b.amount_paise;
+    for (const s of b.shares_paise) {
+      if (!(s.user_id in nets)) nets[s.user_id] = 0;
+      nets[s.user_id] -= s.share_paise;
+      if (s.user_id !== b.payerId) bump(owedPair, `${s.user_id}|${b.payerId}`, s.share_paise);
+    }
+  }
+
+  for (const s of settlements) {
+    const status = (s.status || "COMPLETED").toUpperCase();
+    if (status === "VOID") continue;
+    const paise = typeof s.amount_paise === "number" ? s.amount_paise : toPaise(s.amount ?? 0);
+    if (!Number.isSafeInteger(paise)) continue;
+    if (!(s.fromUserId in nets)) nets[s.fromUserId] = 0;
+    if (!(s.toUserId in nets)) nets[s.toUserId] = 0;
+    nets[s.fromUserId] += paise;
+    nets[s.toUserId] -= paise;
+    if (status === "PENDING") {
+      pendingTouch.add(s.fromUserId);
+      pendingTouch.add(s.toUserId);
+    }
+    bump(settledPair, `${s.fromUserId}|${s.toUserId}`, paise);
+  }
+
+  const ids = new Set(members.map((m) => m.id));
+  for (const id of Object.keys(nets)) ids.add(id);
+  for (const k of [...Object.keys(owedPair), ...Object.keys(settledPair)]) {
+    const [a, b] = k.split("|");
+    ids.add(a);
+    ids.add(b);
+  }
+  const list = [...ids].sort();
+
+  const pairwise = [];
+  for (let i = 0; i < list.length; i++) {
+    for (let j = i + 1; j < list.length; j++) {
+      const a = list[i];
+      const b = list[j];
+      const ab = owedPair[`${a}|${b}`] || 0;
+      const ba = owedPair[`${b}|${a}`] || 0;
+      const sAB = settledPair[`${a}|${b}`] || 0;
+      const sBA = settledPair[`${b}|${a}`] || 0;
+      const direction = (ab - ba) - (sAB - sBA);
+      pairwise.push({
+        a,
+        b,
+        owed_a_to_b_paise: Math.max(direction, 0),
+        owed_b_to_a_paise: Math.max(-direction, 0),
+        settled_ab_paise: Math.max(sAB - sBA, 0),
+        outstanding_a_to_b_paise: Math.max(direction, 0),
+      });
+    }
+  }
+
+  const statuses = {};
+  const flags = {};
+  for (const [id, net] of Object.entries(nets)) {
+    statuses[id] = net < 0 ? "owes" : net > 0 ? "owed" : "settled";
+    flags[id] = { partially_settled: net !== 0 && pendingTouch.has(id) };
+  }
+
+  return { nets, pairwise, statuses, flags };
+}
+
+/**
  * Greedy debt simplification in integer paise. Deterministic: debtors and
  * creditors are sorted by amount descending, tie-break user_id ascending.
  * Accepts either a paise map or a rupee map (legacy callers) — values are
